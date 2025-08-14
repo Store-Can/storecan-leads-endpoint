@@ -1,7 +1,7 @@
 // /api/request-to-deal.js
-// Creates a Bitrix DEAL in your "Invoice Request" stage.
-// Accepts JSON or x-www-form-urlencoded payloads.
-// Understands both the old WP names (billing_*, container_type[], qty[]) and simpler names.
+// Creates a Bitrix DEAL in "Invoice Request" stage.
+// Works with Tally webhook payloads AND classic form posts.
+// Lets the Deal be created even if email and phone are empty.
 
 function splitName(full) {
   if (!full) return { first: "", last: "" };
@@ -20,8 +20,49 @@ function asArray(v) {
   return [v];
 }
 
+// Map Tally webhook => flat object with our expected keys
+function mapFromTally(b) {
+  if (!b || !b.data || !Array.isArray(b.data.fields)) return null;
+
+  const out = {};
+  for (const f of b.data.fields) {
+    const label = String(f.key || f.label || "").toLowerCase();
+    const raw = f.value;
+    const val = typeof raw === "object" && raw && "label" in raw ? raw.label
+              : Array.isArray(raw) ? raw.join(", ")
+              : raw;
+
+    const set = (...names) => names.forEach(n => { if (!(n in out)) out[n] = val; });
+
+    if (label.includes("first") && label.includes("name")) set("billing_first_name","name");
+    else if (label === "name") set("name","billing_first_name");
+    else if (label.includes("email")) set("billing_email","email");
+    else if (label.includes("site contact name")) set("site_contact_name");
+    else if (label.includes("site contact phone")) set("site_contact_phone");
+    else if (label.includes("phone")) set("billing_phone","phone");
+    else if (label.includes("company")) set("company","company_name");
+    else if (label.includes("address")) set("billing_address_1","billing_address");
+    else if (label.includes("pickup city") || label.includes("depot")) set("pickup_city","depot_location","depot_city","pickup_point");
+    else if (label.includes("city")) set("billing_city","city");
+    else if (label.includes("province") || label.includes("state")) set("billing_state","province");
+    else if (label.includes("postal") || label.includes("postcode") || label.includes("zip")) set("billing_postcode","postal_code");
+    else if (label.includes("delivery method")) set("delivery_method");
+    else if (label.includes("door direction")) set("door_direction");
+    else if (label.includes("container") && label.includes("type")) set("container_type");
+    else if (label === "qty" || label.includes("quantity")) set("qty","quantity");
+    else if (label.includes("condition")) set("condition");
+    else if (label.includes("note") || label.includes("message")) set("order_note","message");
+  }
+
+  // Hidden fields from Tally
+  if (b.data.hidden) Object.assign(out, b.data.hidden);
+  if (b.data.url && !out.page_url) out.page_url = b.data.url;
+
+  return out;
+}
+
 export default async function handler(req, res) {
-  // CORS, allow your domains
+  // CORS
   const origins = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || "")
     .split(",").map(s => s.trim()).filter(Boolean);
   const reqOrigin = req.headers.origin || "";
@@ -33,13 +74,12 @@ export default async function handler(req, res) {
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  // Env
   const base = process.env.B24_WEBHOOK_BASE;
-  const DEAL_CATEGORY_ID = Number(process.env.DEAL_CATEGORY_ID || 0); // optional
-  const DEAL_STAGE_ID = process.env.DEAL_STAGE_ID || "";             // required
+  const DEAL_CATEGORY_ID = Number(process.env.DEAL_CATEGORY_ID || 0);
+  const DEAL_STAGE_ID = process.env.DEAL_STAGE_ID || "";
   if (!base || !DEAL_STAGE_ID) return res.status(500).json({ error: "Missing Bitrix env vars" });
 
-  // Parse body, tolerate JSON or x-www-form-urlencoded
+  // Parse body
   let b = {};
   try {
     b = typeof req.body === "string" ? JSON.parse(req.body || "{}") : (req.body || {});
@@ -48,6 +88,10 @@ export default async function handler(req, res) {
     try { b = Object.fromEntries(new URLSearchParams(raw)); } catch { b = {}; }
   }
 
+  // If this is a Tally webhook, remap it
+  const maybeTally = mapFromTally(b);
+  if (maybeTally) b = maybeTally;
+
   // Names and contact
   const { first: splitFirst, last: splitLast } = splitName(b.name || b.billing_first_name || "");
   const firstName = b.first_name || b.billing_first_name || splitFirst || "";
@@ -55,28 +99,31 @@ export default async function handler(req, res) {
   const email     = b.email || b.billing_email || "";
   const phone     = normalizePhone(b.phone || b.billing_phone);
 
-  // Addresses and logistics
+  // Addresses
   const billing_address = b.billing_address_1 || b.billing_address || "";
   const billing_city    = b.billing_city || "";
   const billing_state   = b.billing_state || b.province || "";
   const billing_postal  = b.billing_postcode || b.postal_code || "";
-  const delivery_method = b.delivery_method || "";
-  const pickup_point    = b.pickup_point || "";
-  const door_direction  = b.door_direction || "";
-  const site_contact    = b.site_contact || "";
 
-  // Line items: accept container_type[] + qty[] or single values
-  const ctWP  = b["container_type[]"];
-  const qWP   = b["qty[]"];
-  const ctArr = asArray(ctWP ?? b.container_type);
-  const qArr  = asArray(qWP ?? b.qty);
+  // Delivery vs Pickup
+  const delivery_method_raw = b.delivery_method || "";
+  const delivery_method = delivery_method_raw.toLowerCase();
+  const pickup_city = b.pickup_city || b.depot_location || b.depot_city || b.pickup_point || "";
+  const site_contact_name  = b.site_contact_name || b.site_contact || "";
+  const site_contact_phone = normalizePhone(b.site_contact_phone || "");
+
+  // Line items
+  const ctArr = asArray(b["container_type[]"] ?? b.container_type ?? b.container_size);
+  const qArr  = asArray(b["qty[]"] ?? b.qty ?? b.quantity);
+  const cond  = b.condition || "";
   const items = [];
-  const n = Math.max(ctArr.length, qArr.length);
+  const n = Math.max(ctArr.length, qArr.length, 1);
   for (let i = 0; i < n; i++) {
-    const t = (ctArr[i] || "").toString().trim();
-    const q = (qArr[i] || "").toString().trim();
+    const t = (ctArr[i] ?? ctArr[0] ?? "").toString().trim();
+    const q = (qArr[i]  ?? qArr[0]  ?? "").toString().trim();
     if (t && t.toLowerCase() !== "none") {
-      items.push(`${q || "1"} x ${t}`);
+      const line = [q || "1", "x", t, cond ? `(${cond})` : ""].filter(Boolean).join(" ");
+      items.push(line);
     }
   }
 
@@ -93,10 +140,7 @@ export default async function handler(req, res) {
   const utm_term     = b.utm_term     || b.utmTerm     || "";
   const utm_content  = b.utm_content  || b.utmContent  || "";
 
-  // Minimal validation
-  if (!email && !phone) return res.status(400).json({ error: "Email or phone required" });
-
-  // Bitrix helper
+  // Helper to call Bitrix
   async function b24(method, payload, attempt = 0) {
     const r = await fetch(`${base}${method}.json`, {
       method: "POST",
@@ -113,38 +157,49 @@ export default async function handler(req, res) {
     return j.result;
   }
 
-  // 1) Find or create Contact
+  // Find or create Contact only if we have email or phone
   let contactId = 0;
-  try {
-    const type = email ? "EMAIL" : "PHONE";
-    const values = email ? [email] : [phone];
-    const dup = await b24("crm.duplicate.findbycomm", { entity_type: "CONTACT", type, values });
-    if (dup?.CONTACT?.length) {
-      contactId = dup.CONTACT[0];
-    } else {
-      const contactFields = {
-        NAME: firstName || "",
-        LAST_NAME: lastName || "",
-        EMAIL: email ? [{ VALUE: email, VALUE_TYPE: "WORK" }] : undefined,
-        PHONE: phone ? [{ VALUE: phone, VALUE_TYPE: "WORK" }] : undefined,
-        COMPANY_TITLE: company || undefined
-      };
-      contactId = await b24("crm.contact.add", { fields: contactFields });
+  if (email || phone) {
+    try {
+      const type = email ? "EMAIL" : "PHONE";
+      const values = email ? [email] : [phone];
+      const dup = await b24("crm.duplicate.findbycomm", { entity_type: "CONTACT", type, values });
+      if (dup?.CONTACT?.length) {
+        contactId = dup.CONTACT[0];
+      } else {
+        const contactFields = {
+          NAME: firstName || "",
+          LAST_NAME: lastName || "",
+          EMAIL: email ? [{ VALUE: email, VALUE_TYPE: "WORK" }] : undefined,
+          PHONE: phone ? [{ VALUE: phone, VALUE_TYPE: "WORK" }] : undefined,
+          COMPANY_TITLE: company || undefined
+        };
+        contactId = await b24("crm.contact.add", { fields: contactFields });
+      }
+    } catch {
+      contactId = 0;
     }
-  } catch {
-    contactId = 0;
   }
 
-  // 2) Build Deal fields
-  const comments = [
+  // Build Comments
+  const parts = [
     "Form: invoice_request",
     message ? `Message: ${message}` : null,
     company ? `Company: ${company}` : null,
+    (email || phone) ? null : "No email or phone provided",
     items.length ? `Items:\n- ${items.join("\n- ")}` : null,
-    delivery_method ? `Delivery method: ${delivery_method}` : null,
-    pickup_point ? `Pickup point: ${pickup_point}` : null,
-    door_direction ? `Door direction: ${door_direction}` : null,
-    site_contact ? `Site contact: ${site_contact}` : null,
+    `Delivery method: ${delivery_method_raw || "n/a"}`
+  ];
+  if (delivery_method === "delivery") {
+    parts.push(
+      site_contact_name ? `Site contact name: ${site_contact_name}` : "Site contact name: n/a",
+      site_contact_phone ? `Site contact phone: ${site_contact_phone}` : "Site contact phone: n/a"
+    );
+  }
+  if (delivery_method === "pickup") {
+    parts.push(pickup_city ? `Pickup depot: ${pickup_city}` : "Pickup depot: n/a");
+  }
+  parts.push(
     billing_address ? `Billing address: ${billing_address}` : null,
     billing_city ? `Billing city: ${billing_city}` : null,
     billing_state ? `Billing province: ${billing_state}` : null,
@@ -155,12 +210,14 @@ export default async function handler(req, res) {
     utm_campaign ? `UTM Campaign: ${utm_campaign}` : null,
     utm_term ? `UTM Term: ${utm_term}` : null,
     utm_content ? `UTM Content: ${utm_content}` : null
-  ].filter(Boolean).join("\n");
+  );
+  const comments = parts.filter(Boolean).join("\n");
 
-  const dealFields = {
+  // Create Deal
+  const fields = {
     TITLE: "Invoice Request",
-    CATEGORY_ID: DEAL_CATEGORY_ID || undefined, // your Deals pipeline ID, optional if single pipeline
-    STAGE_ID: DEAL_STAGE_ID,                    // your “Invoice Request” status code
+    CATEGORY_ID: DEAL_CATEGORY_ID || undefined,
+    STAGE_ID: DEAL_STAGE_ID,
     CONTACT_ID: contactId || undefined,
     SOURCE_ID: "WEB",
     COMMENTS: comments,
@@ -168,10 +225,9 @@ export default async function handler(req, res) {
   };
 
   try {
-    const dealId = await b24("crm.deal.add", { fields: dealFields, params: { REGISTER_SONET_EVENT: "Y" } });
-    return res.status(200).json({ status: "created", id: dealId });
+    const id = await b24("crm.deal.add", { fields, params: { REGISTER_SONET_EVENT: "Y" } });
+    return res.status(200).json({ status: "created", id });
   } catch (e) {
     return res.status(502).json({ error: "Bitrix error", message: String(e.message || e) });
   }
 }
-
