@@ -1,34 +1,42 @@
 // /api/request-to-deal.js
-// Creates a Bitrix DEAL in "Invoice Request" stage from a Tally form.
-// This version converts Tally dropdown IDs to their human text,
-// so your Deal contains readable values.
+// Creates a Bitrix DEAL in "Invoice Request" from your Tally form.
+// Fix: convert Tally option IDs to readable text so details show up.
 
 function splitName(full){ if(!full) return {first:"",last:""}; const p=String(full).trim().split(/\s+/); return { first:p.shift()||"", last:p.join(" ") }; }
 function normalizePhone(s){ if(!s) return ""; return String(s).replace(/[^\d+]/g,""); }
 function asArray(v){ if(v==null) return []; return Array.isArray(v)?v:[v]; }
 
-// Convert Tally field value to readable text
+// Turn Tally field value into human text
 function pickValue(f){
-  // Single select object with { label }
-  if (f && typeof f.value === "object" && f.value && "label" in f.value) return f.value.label;
-  // Multi/select value is an array of IDs, map to option text
-  if (Array.isArray(f?.value) && Array.isArray(f?.options)) {
-    const idSet = new Set(f.value);
-    const labels = f.options.filter(o => idSet.has(o.id)).map(o => o.text);
-    if (labels.length) return labels.join(", ");
+  const v = f?.value;
+
+  // Case 1: value is an object like { label: "Delivery" }
+  if (v && typeof v === "object" && "label" in v) return v.label;
+
+  // Case 2: value is an array of option IDs (multi-select)
+  if (Array.isArray(v) && Array.isArray(f?.options)) {
+    const byId = new Map((f.options||[]).map(o => [String(o.id), o.text || o.label || String(o.id)]));
+    return v.map(id => byId.get(String(id)) || String(id)).join(", ");
   }
-  // Plain value
-  return f?.value ?? "";
+
+  // Case 3: value is a single option ID (dropdown)
+  if ((typeof v === "string" || typeof v === "number") && Array.isArray(f?.options)) {
+    const opt = (f.options||[]).find(o => String(o.id) === String(v));
+    if (opt) return opt.text || opt.label || String(v);
+  }
+
+  // Case 4: plain text
+  return v ?? "";
 }
 
-// Map Tally webhook into flat key/value
-function mapFromTally(b){
-  if (!b || !b.data || !Array.isArray(b.data.fields)) return null;
+// Map Tally webhook into simple key/value pairs
+function mapFromTally(body){
+  if (!body || !body.data || !Array.isArray(body.data.fields)) return null;
   const out = {};
-  for (const f of b.data.fields) {
-    const label = String(f.key || f.label || "").toLowerCase().trim();
+  for (const f of body.data.fields) {
+    const rawLabel = String(f.key || f.label || "");
+    const label = rawLabel.toLowerCase().trim();
     const val = pickValue(f);
-
     const set = (...names)=> names.forEach(n => { if (!(n in out)) out[n] = val; });
 
     // Contact / billing
@@ -43,13 +51,13 @@ function mapFromTally(b){
     else if (label.includes("province") || label.includes("state")) set("billing_state","province");
     else if (label.includes("postal") || label.includes("postcode") || label.includes("zip")) set("billing_postcode","postal_code");
 
-    // Delivery vs pickup (from your old form emails)
-    else if (label === "method" || label.includes("delivery method")) set("delivery_method");
-    else if (label === "location" || label.includes("depot")) set("pickup_city","depot_location","depot_city","pickup_point");
+    // Delivery / pickup
+    else if (label === "method" || label.includes("delivery method") || (label.includes("method") && label.includes("delivery"))) set("delivery_method");
+    else if (label === "location" || label.includes("depot") || label.includes("pickup city")) set("pickup_city","depot_location","depot_city","pickup_point");
     else if (label.includes("container doors direction")) set("door_direction");
     else if (label.includes("delivery address") || label.includes("map pin") || label.includes("coordinates")) set("delivery_map_pin");
 
-    // Site contact, combined or split
+    // Site contact
     else if (label.includes("site contact name")) set("site_contact_name");
     else if (label.includes("site contact phone")) set("site_contact_phone");
     else if (label.includes("site contact")) set("site_contact");
@@ -64,10 +72,10 @@ function mapFromTally(b){
   }
 
   // Tally meta
-  if (b.data.hidden) Object.assign(out, b.data.hidden);
-  if (b.data.url && !out.page_url) out.page_url = b.data.url;
-  if (b.data.ip && !out.ip) out.ip = b.data.ip;
-  if (b.data.userAgent && !out.user_agent) out.user_agent = b.data.userAgent;
+  if (body.data.hidden) Object.assign(out, body.data.hidden);
+  if (body.data.url && !out.page_url) out.page_url = body.data.url;
+  if (body.data.ip && !out.ip) out.ip = body.data.ip;
+  if (body.data.userAgent && !out.user_agent) out.user_agent = body.data.userAgent;
 
   return out;
 }
@@ -116,7 +124,6 @@ export default async function handler(req,res){
 
   // Delivery / pickup
   const delivery_method_raw = b.delivery_method || "";
-  const delivery_method = String(delivery_method_raw).toLowerCase();
   const pickup_city = b.pickup_city || b.depot_location || b.depot_city || b.pickup_point || "";
   const door_direction = b.door_direction || "";
   const delivery_map_pin = b.delivery_map_pin || "";
@@ -156,7 +163,7 @@ export default async function handler(req,res){
     return j.result;
   }
 
-  // Optional: link contact only if we have any contact info
+  // Link contact only if we have an email or phone
   let contactId = 0;
   if (email || phone) {
     try{
@@ -224,6 +231,4 @@ export default async function handler(req,res){
     const id = await b24("crm.deal.add", { fields, params: { REGISTER_SONET_EVENT: "Y" } });
     return res.status(200).json({ status:"created", id });
   } catch (e) {
-    return res.status(502).json({ error:"Bitrix error", message:String(e.message||e) });
-  }
-}
+    return res.status(502).json({ error:"Bitrix error", message:String(e.message||e) })
