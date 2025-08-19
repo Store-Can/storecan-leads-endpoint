@@ -1,70 +1,98 @@
 // /api/request-to-deal.js
 export default async function handler(req, res) {
+  const allowOrigin = process.env.ALLOWED_ORIGIN || "*";
+
   // CORS preflight
   if (req.method === "OPTIONS") {
-    res.setHeader("Access-Control-Allow-Origin", process.env.ALLOWED_ORIGIN || "*");
+    res.setHeader("Access-Control-Allow-Origin", allowOrigin);
     res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
     return res.status(200).end();
   }
 
-  try {
-    if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
-    const allowOrigin = process.env.ALLOWED_ORIGIN || "*";
-    const origin = req.headers.origin || "";
-    if (allowOrigin !== "*" && origin !== allowOrigin) {
-      return res.status(403).json({ error: "Forbidden origin" });
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  // Read body as JSON or x-www-form-urlencoded (Framer supports both)
+  async function readBody(req) {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const raw = Buffer.concat(chunks).toString("utf8") || "";
+    try { return raw ? JSON.parse(raw) : {}; } catch (_) {
+      try { return Object.fromEntries(new URLSearchParams(raw)); } catch { return {}; }
     }
+  }
 
-    const hook = process.env.BITRIX_WEBHOOK_REQUESTS;  // dedicated webhook for Framer requests
+  try {
+    const b = await readBody(req);
+
+    const hook = process.env.BITRIX_WEBHOOK_REQUESTS;
     if (!hook) return res.status(500).json({ error: "Missing BITRIX_WEBHOOK_REQUESTS" });
 
-    const categoryId = Number(process.env.DEAL_CATEGORY_ID || 0);
-    const stageId = process.env.DEAL_STAGE_ID || "";
+    const categoryId = Number(process.env.REQUEST_CATEGORY_ID ?? 0);
+    let stageId = process.env.REQUEST_STAGE_ID || "";
+    if (!stageId) stageId = categoryId === 0 ? "NEW" : `C${categoryId}:NEW`;
+
     const assignedById = Number(process.env.ASSIGNED_BY_ID || 0);
     const sourceId = process.env.DEAL_SOURCE_ID || "WEB";
 
-    const body = req.body || {};
-    const {
-      name = "", email = "", phone = "",
-      message = "", containerSize = "",
-      location = "", province = "",
-      utm_source = "", utm_medium = "", utm_campaign = ""
-    } = body;
+    const get = k => (b?.[k] ?? "").toString();
 
-    // 1) Find or create Contact
-    let contactId;
-    async function contactSearch(filter) {
-      const r = await fetch(`${hook}crm.contact.list.json`, {
+    const first = get("firstName");
+    const last = get("lastName");
+    const name =
+      get("name") || get("fullName") || [first, last].filter(Boolean).join(" ").trim() || "Website visitor";
+
+    const email = get("email");
+    const phone = get("phone");
+    const message = get("message");
+    const containerSize = get("containerSize") || get("size");
+    const location = get("city") || get("location");
+    const province = get("province") || get("state");
+    const utm_source = get("utm_source");
+    const utm_medium = get("utm_medium");
+    const utm_campaign = get("utm_campaign");
+
+    // Helpers
+    async function b24(method, payload) {
+      const r = await fetch(`${hook}${method}.json`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ filter, select: ["ID"] })
+        body: JSON.stringify(payload || {})
       }).then(x => x.json());
+      return r;
+    }
+
+    // 1) Find or create contact
+    async function findContact(filter) {
+      const r = await b24("crm.contact.list", { filter, select: ["ID"] });
       return r?.result?.[0]?.ID;
     }
-    if (email) contactId = await contactSearch({ "EMAIL": email });
-    if (!contactId && phone) contactId = await contactSearch({ "PHONE": phone });
+
+    let contactId;
+    if (email) contactId = await findContact({ EMAIL: email });
+    if (!contactId && phone) contactId = await findContact({ PHONE: phone });
 
     if (!contactId) {
-      const add = await fetch(`${hook}crm.contact.add.json`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          fields: {
-            NAME: name || "Website visitor",
-            ASSIGNED_BY_ID: assignedById || undefined,
-            EMAIL: email ? [{ VALUE: email, VALUE_TYPE: "WORK" }] : [],
-            PHONE: phone ? [{ VALUE: phone, VALUE_TYPE: "WORK" }] : [],
-            SOURCE_ID: sourceId
-          }
-        })
-      }).then(x => x.json());
+      const add = await b24("crm.contact.add", {
+        fields: {
+          NAME: name,
+          ASSIGNED_BY_ID: assignedById || undefined,
+          EMAIL: email ? [{ VALUE: email, VALUE_TYPE: "WORK" }] : [],
+          PHONE: phone ? [{ VALUE: phone, VALUE_TYPE: "WORK" }] : [],
+          SOURCE_ID: sourceId
+        }
+      });
       if (!add?.result) return res.status(500).json({ error: "Failed to create contact", details: add });
       contactId = add.result;
     }
 
-    // 2) Create Deal in Category 6, Stage C6:NEW
+    // 2) Create deal
     const title = `Website Request - ${containerSize || "Container"} - ${location || "Location unknown"}`;
     const comments = [
       message && `Message: ${message}`,
@@ -78,28 +106,20 @@ export default async function handler(req, res) {
       utm_campaign && `UTM campaign: ${utm_campaign}`
     ].filter(Boolean).join("\n");
 
-    const dealAdd = await fetch(`${hook}crm.deal.add.json`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        fields: {
-          TITLE: title,
-          CATEGORY_ID: categoryId,
-          STAGE_ID: stageId,
-          ASSIGNED_BY_ID: assignedById || undefined,
-          CONTACT_ID: contactId,
-          SOURCE_ID: sourceId,
-          COMMENTS: comments
-          // Map your UF_CRM_* fields here if needed
-        }
-      })
-    }).then(x => x.json());
+    const dealAdd = await b24("crm.deal.add", {
+      fields: {
+        TITLE: title,
+        CATEGORY_ID: categoryId,
+        STAGE_ID: stageId,
+        ASSIGNED_BY_ID: assignedById || undefined,
+        CONTACT_ID: contactId,
+        SOURCE_ID: sourceId,
+        SOURCE_DESCRIPTION: "new.storecan.ca",
+        COMMENTS: comments
+      }
+    });
 
     if (!dealAdd?.result) return res.status(500).json({ error: "Failed to create deal", details: dealAdd });
-
-    res.setHeader("Access-Control-Allow-Origin", allowOrigin === "*" ? "*" : allowOrigin);
-    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
     return res.status(200).json({ ok: true, dealId: dealAdd.result, contactId });
   } catch (e) {
