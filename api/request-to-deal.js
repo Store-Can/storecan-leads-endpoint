@@ -1,6 +1,13 @@
 // /api/request-to-deal.js
 export default async function handler(req, res) {
-  const allowOrigin = process.env.ALLOWED_ORIGIN || "*";
+ const originHeader = req.headers.origin || "";
+const allowedList = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || "*")
+  .split(",").map(s => s.trim()).filter(Boolean);
+const allowOrigin =
+  allowedList.includes("*") ? "*" :
+  allowedList.includes(originHeader) ? originHeader :
+  allowedList[0] || "*";
+
 
   // CORS preflight
   if (req.method === "OPTIONS") {
