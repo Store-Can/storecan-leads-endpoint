@@ -1,9 +1,6 @@
 // /api/quote-to-deal.js – INVOICE REQUEST (Invoice pipeline)
-// Final fix v2: robust ID → Label resolution with three sources
-// 1) Direct labels in payload
-// 2) Dynamic options captured from payload (fields.options.choices)
-// 3) Static + ENV dictionary (FORM_OPTION_MAP_JSON)
-// Also supports a third container type line and maps new doors UUID.
+// Final fix v3: robust ID → Label resolution with three sources, support for third container type,
+// new label "Container door orientation", and reliable quantity parsing for duplicated "Quantity" fields.
 export default async function handler(req, res) {
   // CORS
   const originHeader = req.headers.origin || "";
@@ -42,7 +39,6 @@ export default async function handler(req, res) {
   const toInt = v => { const n = parseInt(String(v ?? "").replace(/[^0-9]/g, ""), 10); return Number.isFinite(n) ? n : undefined; };
 
   // ------------- dictionaries -------------
-  // Static map with IDs seen so far
   const STATIC_MAP = {
     container_type: {
       "e7ae7ebd-0f39-4584-96a9-5f5154bdbbfb": "40’L x 8’W x 9’6”H HC New (1trip) Double Doors",
@@ -64,11 +60,9 @@ export default async function handler(req, res) {
     }
   };
 
-  // Allow overrides via env JSON
   let ENV_MAP = {};
   try { ENV_MAP = JSON.parse(process.env.FORM_OPTION_MAP_JSON || "{}"); } catch { ENV_MAP = {}; }
 
-  // We will also learn choices from the incoming payload
   const DYNAMIC_MAP = { container_type: {}, province: {}, method: {}, doors_direction: {} };
 
   const mergeMaps = () => ({
@@ -81,7 +75,7 @@ export default async function handler(req, res) {
   const resolveOption = (group, val, MERGED) => {
     if (!val) return val;
     const v = String(val);
-    if (!looksLikeUUID(v)) return v; // already a label
+    if (!looksLikeUUID(v)) return v;
     return MERGED[group]?.[v] || v;
   };
 
@@ -102,7 +96,7 @@ export default async function handler(req, res) {
       let group = "";
       if (/(add a second container type|add a third container type|container type)/i.test(L)) group = "container_type";
       else if (/province/.test(L)) group = "province";
-      else if (/doors direction|doors.*pickup/.test(L)) group = "doors_direction";
+      else if (/door orientation|doors direction|doors.*pickup/.test(L)) group = "doors_direction";
       else if (/method/.test(L)) group = "method";
       if (!group) return;
       for (const o of opts) {
@@ -114,7 +108,6 @@ export default async function handler(req, res) {
 
     const toLabel = (f) => {
       let v = f?.value;
-      // Learn choices from field config, if present
       const choicesArr = f?.options?.choices || f?.options || f?.choices || [];
       harvestChoices(f?.label || f?.key || f?.id, choicesArr);
 
@@ -124,7 +117,6 @@ export default async function handler(req, res) {
       }
       if (v && typeof v === "object") return v.label || v.name || v.text || v.value || JSON.stringify(v);
 
-      // If value appears to be an id, try match against harvested choices
       if (looksLikeUUID(String(v)) && choicesArr?.length) {
         const hit = choicesArr.find(o => o?.id === v || o?.value === v || o?.key === v);
         if (hit) return hit.label || hit.name || hit.value || String(v);
@@ -168,15 +160,17 @@ export default async function handler(req, res) {
 
     const pick = (...c) => { for (const k of c) { const v = flat[norm(k)]; if (v) return v; } return ""; };
 
-    // Fields including third container type
+    // Container types
     let containerType1 = resolveOption("container_type", pick("container type", "container_type", "container size"), MERGED_MAP);
-    const quantity1    = toInt(pick("quantity", "quantity_1", "qty", "count"));
-
     let containerType2 = resolveOption("container_type", pick("add a second container type to this order", "container type 2", "second container type"), MERGED_MAP);
-    const quantity2    = toInt(flat["quantity_2"]) || toInt(flat["quantity_3"]) || undefined;
+    let containerType3 = resolveOption("container_type", pick("add a third container type to this order", "add third container type to this order", "container type 3", "third container type"), MERGED_MAP);
 
-    let containerType3 = resolveOption("container_type", pick("add a third container type to this order", "container type 3", "third container type"), MERGED_MAP);
-    const quantity3    = toInt(flat["quantity_3"]) && quantity2 ? toInt(flat["quantity_4"]) : toInt(flat["quantity_3"]);
+    // Quantities, robust sequencing
+    const qValsRaw = [flat["quantity"], flat["quantity_2"], flat["quantity_3"], flat["quantity_4"], flat["quantity_5"], flat["quantity_6"]];
+    const qVals = qValsRaw.map(v => toInt(v)).filter(v => typeof v === 'number');
+    const quantity1 = qVals[0];
+    const quantity2 = qVals[1];
+    const quantity3 = qVals[2];
 
     const orderComments= pick("comments", "order_comments");
     const name         = pick("name", "full_name");
@@ -191,7 +185,7 @@ export default async function handler(req, res) {
     if (method) method = method[0].toUpperCase() + method.slice(1).toLowerCase();
 
     const deliveryAddr = pick("delivery address/map pin/coordinates", "delivery_address", "map pin", "coordinates");
-    let doorsDirection = resolveOption("doors_direction", pick("container doors direction for pickup", "doors_direction"), MERGED_MAP);
+    let doorsDirection = resolveOption("doors_direction", pick("container door orientation", "container doors direction for pickup", "doors_direction"), MERGED_MAP);
     if (doorsDirection) {
       const v = doorsDirection.toLowerCase();
       if (["cab", "to_cab", "doors_to_cab", "front", "doors to the cab"].includes(v)) doorsDirection = "Doors to the Cab";
@@ -217,7 +211,7 @@ export default async function handler(req, res) {
       if (c?.result) contactId = c.result;
     }
 
-    // Display helper: if still a UUID after all attempts, show a friendly placeholder
+    // Display helper: if still a UUID, show a friendly placeholder
     const display = (group, v) => {
       if (!v) return "";
       return looksLikeUUID(v) ? "Selection not captured" : v;
@@ -227,13 +221,13 @@ export default async function handler(req, res) {
     lines.push("Form: invoice request");
 
     if (containerType1) { lines.push("", "Container type", display("container_type", containerType1)); }
-    if (quantity1)      { lines.push("", "Quantity", String(quantity1)); }
+    if (quantity1 !== undefined) { lines.push("", "Quantity", String(quantity1)); }
 
     if (containerType2) { lines.push("", "Add a second container type to this order", display("container_type", containerType2)); }
-    if (quantity2)      { lines.push("", "Quantity", String(quantity2)); }
+    if (quantity2 !== undefined) { lines.push("", "Quantity", String(quantity2)); }
 
     if (containerType3) { lines.push("", "Add a third container type to this order", display("container_type", containerType3)); }
-    if (quantity3)      { lines.push("", "Quantity", String(quantity3)); }
+    if (quantity3 !== undefined) { lines.push("", "Quantity", String(quantity3)); }
 
     if (orderComments)  { lines.push("", "Comments", orderComments); }
     if (name)           { lines.push("", "Name", name); }
@@ -249,7 +243,8 @@ export default async function handler(req, res) {
     if (sitePhone)      { lines.push("", "Site contact phone number", sitePhone); }
     if (deliveryNotes)  { lines.push("", "Delivery comments", deliveryNotes); }
 
-    const comments = lines.join("\n");
+    const comments = lines.join("
+");
 
     // Pipeline
     const CATEGORY_ID = Number(process.env.INVOICE_CATEGORY_ID ?? 6);
@@ -257,7 +252,6 @@ export default async function handler(req, res) {
     const assignedById = Number(process.env.ASSIGNED_BY_ID || 0);
     const sourceId     = process.env.DEAL_SOURCE_ID || "WEB";
 
-    // Title: Invoice Request (NEW100xxxxx)
     const autoNumber = `NEW100${Date.now().toString().slice(-5)}`;
     const title = `Invoice Request (${autoNumber})`;
 
