@@ -1,5 +1,43 @@
 // /api/quote-to-deal.js
 export default async function handler(req, res) {
+    // CORS allow-list
+  const originHeader = req.headers.origin || "";
+  const allowedList = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || "*")
+    .split(",").map(s => s.trim()).filter(Boolean);
+  const allowOrigin =
+    allowedList.includes("*") ? "*" :
+    allowedList.includes(originHeader) ? originHeader :
+    allowedList[0] || "*";
+
+  if (req.method === "OPTIONS") {
+    res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    return res.status(200).end();
+  }
+
+  if (req.method !== "POST" && req.method !== "GET") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  // Read body as JSON or x-www-form-urlencoded
+  async function readBody(req) {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const raw = Buffer.concat(chunks).toString("utf8") || "";
+    try { return raw ? JSON.parse(raw) : {}; } catch (_) {
+      try { return Object.fromEntries(new URLSearchParams(raw)); } catch { return {}; }
+    }
+  }
+
+  if (req.method === "GET") {
+    return res.status(200).json({ ok: true, method: "GET", stage: "stub-get" });
+  }
+
   if (req.method === 'GET') {
     return res.status(200).json({ ok: true, method: 'GET', stage: 'stub-get' });
   }
