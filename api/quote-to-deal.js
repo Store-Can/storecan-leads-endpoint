@@ -1,6 +1,9 @@
 // /api/quote-to-deal.js – INVOICE REQUEST (Invoice pipeline)
-// Final fix: reliable ID → Label mapping for Container Types and Province,
-// env‑driven dictionary, and stable auto title "Invoice Request (NEW100xxxxx)".
+// Final fix v2: robust ID → Label resolution with three sources
+// 1) Direct labels in payload
+// 2) Dynamic options captured from payload (fields.options.choices)
+// 3) Static + ENV dictionary (FORM_OPTION_MAP_JSON)
+// Also supports a third container type line and maps new doors UUID.
 export default async function handler(req, res) {
   // CORS
   const originHeader = req.headers.origin || "";
@@ -38,21 +41,15 @@ export default async function handler(req, res) {
   const cleanPhone = p => (p || "").replace(/[^+0-9]/g, "");
   const toInt = v => { const n = parseInt(String(v ?? "").replace(/[^0-9]/g, ""), 10); return Number.isFinite(n) ? n : undefined; };
 
-  // Build a resolvable options dictionary, merging static + env JSON
-  // You can maintain these without code changes by setting FORM_OPTION_MAP_JSON, for example:
-  // {
-  //   "container_type": { "fc2e9e61-be19-4065-9e5a-9b926e7c5544": "40' HC New Double Doors" },
-  //   "province": { "d0a3ca2e-7b91-4c3e-9925-4d912385c176": "Alberta" }
-  // }
+  // ------------- dictionaries -------------
+  // Static map with IDs seen so far
   const STATIC_MAP = {
     container_type: {
-      // older IDs we saw earlier
       "e7ae7ebd-0f39-4584-96a9-5f5154bdbbfb": "40’L x 8’W x 9’6”H HC New (1trip) Double Doors",
       "681d358d-ca15-49cc-a215-84edf5d08fb3": "40’L x 8’W x 9’6”H HC New (1trip)",
       "00a288e5-000d-4125-b6ab-bc4a33773912": "40’L x 8’W x 9’6”H HC New (1trip) Double Doors",
       "32ed3669-a335-4852-870a-abdf2c137df1": "40’L x 8’W x 9’6”H HC New (1trip)",
-      // latest IDs from your screenshot
-      "fc2e9e61-be19-4065-9e5a-9b926e7c5544": "40’ HC New (1trip) Double Doors", // update label if needed
+      "fc2e9e61-be19-4065-9e5a-9b926e7c5544": "40’ HC New (1trip) Double Doors",
       "4b9f8044-5102-49a4-8ee0-4487ee1afb3f": "40’ HC New (1trip)"
     },
     province: {
@@ -61,28 +58,35 @@ export default async function handler(req, res) {
       "d0a3ca2e-7b91-4c3e-9925-4d912385c176": "Alberta"
     },
     method: { "5de9e305-16e5-43fa-9997-dd2d1c44515d": "Delivery" },
-    doors_direction: { "47b72b20-b047-4c7a-8d71-8678f05a75ef": "Doors to the Cab" }
-  };
-  let ENV_MAP = {};
-  try { ENV_MAP = JSON.parse(process.env.FORM_OPTION_MAP_JSON || "{}"); } catch { ENV_MAP = {}; }
-  const MERGED_MAP = {
-    container_type: { ...(STATIC_MAP.container_type || {}), ...((ENV_MAP.container_type) || {}) },
-    province: { ...(STATIC_MAP.province || {}), ...((ENV_MAP.province) || {}) },
-    method: { ...(STATIC_MAP.method || {}), ...((ENV_MAP.method) || {}) },
-    doors_direction: { ...(STATIC_MAP.doors_direction || {}), ...((ENV_MAP.doors_direction) || {}) }
-  };
-  const resolveOption = (group, val) => {
-    if (!val) return val;
-    const v = String(val).trim();
-    // already a human value
-    if (!looksLikeUUID(v)) return v;
-    // dictionary mapping
-    const hit = MERGED_MAP[group]?.[v];
-    return hit || v; // if not found, keep id, but we format it clearly below
+    doors_direction: {
+      "47b72b20-b047-4c7a-8d71-8678f05a75ef": "Doors to the Cab",
+      "85a4764b-6cde-4485-bcb9-31bca4018eaf": "Doors to the Back"
+    }
   };
 
-  // Flattener that prefers human text when provided by the payload
-  function toFlat(payload) {
+  // Allow overrides via env JSON
+  let ENV_MAP = {};
+  try { ENV_MAP = JSON.parse(process.env.FORM_OPTION_MAP_JSON || "{}"); } catch { ENV_MAP = {}; }
+
+  // We will also learn choices from the incoming payload
+  const DYNAMIC_MAP = { container_type: {}, province: {}, method: {}, doors_direction: {} };
+
+  const mergeMaps = () => ({
+    container_type: { ...STATIC_MAP.container_type, ...(ENV_MAP.container_type || {}), ...DYNAMIC_MAP.container_type },
+    province:       { ...STATIC_MAP.province,       ...(ENV_MAP.province || {}),       ...DYNAMIC_MAP.province },
+    method:         { ...STATIC_MAP.method,         ...(ENV_MAP.method || {}),         ...DYNAMIC_MAP.method },
+    doors_direction:{ ...STATIC_MAP.doors_direction, ...(ENV_MAP.doors_direction || {}), ...DYNAMIC_MAP.doors_direction }
+  });
+
+  const resolveOption = (group, val, MERGED) => {
+    if (!val) return val;
+    const v = String(val);
+    if (!looksLikeUUID(v)) return v; // already a label
+    return MERGED[group]?.[v] || v;
+  };
+
+  // Flattener that also harvests choice dictionaries
+  function toFlatAndChoices(payload) {
     const flat = {};
     const counts = {};
     const set = (key, val) => {
@@ -92,22 +96,38 @@ export default async function handler(req, res) {
       flat[k] = typeof val === "string" ? val : JSON.stringify(val);
     };
 
+    const harvestChoices = (fieldLabel, opts) => {
+      if (!Array.isArray(opts) || !opts.length) return;
+      const L = (fieldLabel || "").toLowerCase();
+      let group = "";
+      if (/(add a second container type|add a third container type|container type)/i.test(L)) group = "container_type";
+      else if (/province/.test(L)) group = "province";
+      else if (/doors direction|doors.*pickup/.test(L)) group = "doors_direction";
+      else if (/method/.test(L)) group = "method";
+      if (!group) return;
+      for (const o of opts) {
+        const id = o?.id || o?.value || o?.key;
+        const label = o?.label || o?.name || o?.value;
+        if (id && label && looksLikeUUID(String(id))) DYNAMIC_MAP[group][String(id)] = label;
+      }
+    };
+
     const toLabel = (f) => {
       let v = f?.value;
+      // Learn choices from field config, if present
+      const choicesArr = f?.options?.choices || f?.options || f?.choices || [];
+      harvestChoices(f?.label || f?.key || f?.id, choicesArr);
+
       if (Array.isArray(v)) {
         const labels = v.map(x => (x && typeof x === "object") ? (x.label || x.name || x.text || x.value) : x).filter(Boolean);
         if (labels.length) return labels.join(", ");
       }
       if (v && typeof v === "object") return v.label || v.name || v.text || v.value || JSON.stringify(v);
-      // some payloads include choices in field metadata, try to map here if present
-      const opts = f?.options?.choices || f?.options || f?.choices || [];
-      if (opts && v) {
-        const arr = Array.isArray(v) ? v : [v];
-        const labels = arr.map(id => {
-          const hit = opts.find(o => o?.id === id || o?.value === id || o?.key === id || o === id);
-          return hit?.label || hit?.name || hit?.value || id;
-        }).filter(Boolean);
-        if (labels.length) return labels.join(", ");
+
+      // If value appears to be an id, try match against harvested choices
+      if (looksLikeUUID(String(v)) && choicesArr?.length) {
+        const hit = choicesArr.find(o => o?.id === v || o?.value === v || o?.key === v);
+        if (hit) return hit.label || hit.name || hit.value || String(v);
       }
       return (v === undefined || v === null) ? "" : String(v);
     };
@@ -143,14 +163,20 @@ export default async function handler(req, res) {
     if (!base) return res.status(500).json({ error: "Missing B24_WEBHOOK_BASE" });
 
     const raw = await readBody(req);
-    const flat = toFlat(raw);
+    const flat = toFlatAndChoices(raw);
+    const MERGED_MAP = mergeMaps();
+
     const pick = (...c) => { for (const k of c) { const v = flat[norm(k)]; if (v) return v; } return ""; };
 
-    // Map fields and resolve known UUIDs to labels
-    let containerType1 = resolveOption("container_type", pick("container type", "container_type", "container size"));
+    // Fields including third container type
+    let containerType1 = resolveOption("container_type", pick("container type", "container_type", "container size"), MERGED_MAP);
     const quantity1    = toInt(pick("quantity", "quantity_1", "qty", "count"));
-    let containerType2 = resolveOption("container_type", pick("add a second container type to this order", "container type 2", "second container type"));
+
+    let containerType2 = resolveOption("container_type", pick("add a second container type to this order", "container type 2", "second container type"), MERGED_MAP);
     const quantity2    = toInt(flat["quantity_2"]) || toInt(flat["quantity_3"]) || undefined;
+
+    let containerType3 = resolveOption("container_type", pick("add a third container type to this order", "container type 3", "third container type"), MERGED_MAP);
+    const quantity3    = toInt(flat["quantity_3"]) && quantity2 ? toInt(flat["quantity_4"]) : toInt(flat["quantity_3"]);
 
     const orderComments= pick("comments", "order_comments");
     const name         = pick("name", "full_name");
@@ -158,14 +184,14 @@ export default async function handler(req, res) {
     const phone        = cleanPhone(pick("phone number", "phone_number", "phone"));
 
     const billingAddr  = pick("billing address", "billing_address");
-    let province       = resolveOption("province", pick("province", "province_state"));
+    let province       = resolveOption("province", pick("province", "province_state"), MERGED_MAP);
     const city         = pick("city", "billing_city");
 
-    let method         = resolveOption("method", pick("method", "delivery_method"));
+    let method         = resolveOption("method", pick("method", "delivery_method"), MERGED_MAP);
     if (method) method = method[0].toUpperCase() + method.slice(1).toLowerCase();
 
     const deliveryAddr = pick("delivery address/map pin/coordinates", "delivery_address", "map pin", "coordinates");
-    let doorsDirection = resolveOption("doors_direction", pick("container doors direction for pickup", "doors_direction"));
+    let doorsDirection = resolveOption("doors_direction", pick("container doors direction for pickup", "doors_direction"), MERGED_MAP);
     if (doorsDirection) {
       const v = doorsDirection.toLowerCase();
       if (["cab", "to_cab", "doors_to_cab", "front", "doors to the cab"].includes(v)) doorsDirection = "Doors to the Cab";
@@ -191,20 +217,24 @@ export default async function handler(req, res) {
       if (c?.result) contactId = c.result;
     }
 
-    // Comments block, never display raw UUIDs, show a friendly placeholder if mapping missing
+    // Display helper: if still a UUID after all attempts, show a friendly placeholder
     const display = (group, v) => {
       if (!v) return "";
-      if (!looksLikeUUID(v)) return v;
-      const hit = MERGED_MAP[group]?.[v];
-      return hit || "Selection not captured"; // prevents ugly IDs appearing
+      return looksLikeUUID(v) ? "Selection not captured" : v;
     };
 
     const lines = [];
     lines.push("Form: invoice request");
+
     if (containerType1) { lines.push("", "Container type", display("container_type", containerType1)); }
     if (quantity1)      { lines.push("", "Quantity", String(quantity1)); }
+
     if (containerType2) { lines.push("", "Add a second container type to this order", display("container_type", containerType2)); }
     if (quantity2)      { lines.push("", "Quantity", String(quantity2)); }
+
+    if (containerType3) { lines.push("", "Add a third container type to this order", display("container_type", containerType3)); }
+    if (quantity3)      { lines.push("", "Quantity", String(quantity3)); }
+
     if (orderComments)  { lines.push("", "Comments", orderComments); }
     if (name)           { lines.push("", "Name", name); }
     if (email)          { lines.push("", "Email", email); }
@@ -214,7 +244,7 @@ export default async function handler(req, res) {
     if (city)           { lines.push("", "City", city); }
     if (method)         { lines.push("", "Method", method); }
     if (deliveryAddr)   { lines.push("", "Delivery address/Map Pin/Coordinates", deliveryAddr); }
-    if (doorsDirection) { lines.push("", "Container doors direction for pickup", doorsDirection); }
+    if (doorsDirection) { lines.push("", "Container door orientation", doorsDirection); }
     if (siteName)       { lines.push("", "Site contact name", siteName); }
     if (sitePhone)      { lines.push("", "Site contact phone number", sitePhone); }
     if (deliveryNotes)  { lines.push("", "Delivery comments", deliveryNotes); }
