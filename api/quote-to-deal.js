@@ -1,4 +1,4 @@
-// /api/quote-to-deal.js  — INVOICE REQUEST (Invoice pipeline)
+// /api/quote-to-deal.js  – INVOICE REQUEST (Invoice pipeline)
 export default async function handler(req, res) {
   // CORS allow-list
   const originHeader = req.headers.origin || "";
@@ -47,51 +47,43 @@ export default async function handler(req, res) {
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "");
 
-  // try to convert Tally/Typeform shapes into readable labels
+  // best effort form flattener, supports duplicate labels (e.g., two "Quantity")
   function toFlat(payload) {
     const flat = {};
+    const counts = {};
     const set = (key, val) => {
       if (val === undefined || val === null || val === "") return;
-      const k = norm(key);
-      if (!flat[k]) flat[k] = typeof val === "string" ? val : JSON.stringify(val);
+      let k = norm(key);
+      if (flat[k]) {
+        counts[k] = (counts[k] || 1) + 1;
+        k = `${k}_${counts[k]}`;
+      } else {
+        counts[k] = 1;
+      }
+      flat[k] = typeof val === "string" ? val : JSON.stringify(val);
     };
 
-    // best-effort extractor for a field value to human-readable
     const toLabel = (f) => {
       let v = f?.value;
-
-      // arrays: list of objects with label/name/value, or list of raw ids
       if (Array.isArray(v)) {
-        const labels = v.map(x =>
-          (x && typeof x === "object")
-            ? (x.label || x.name || x.text || x.value || x.choice || x.email || x.phone)
-            : x
-        ).filter(Boolean);
+        const labels = v.map(x => (x && typeof x === "object")
+          ? (x.label || x.name || x.text || x.value || x.choice || x.email || x.phone)
+          : x).filter(Boolean);
         if (labels.length) return labels.join(", ");
       }
-
-      // single object with label/name/value
       if (v && typeof v === "object") {
         return v.label || v.name || v.text || v.value || v.choice || v.email || v.phone || JSON.stringify(v);
       }
-
-      // some payloads keep selected ids in value, with options listed separately
       const opts = f?.options?.choices || f?.options || f?.choices || [];
       if (opts && v) {
         const asArray = Array.isArray(v) ? v : [v];
         const labels = asArray.map(id => {
-          const hit = opts.find(o =>
-            o?.id === id || o?.key === id || o?.value === id || o === id
-          );
+          const hit = opts.find(o => o?.id === id || o?.key === id || o?.value === id || o === id);
           return hit?.label || hit?.name || hit?.value || hit || id;
         }).filter(Boolean);
         if (labels.length) return labels.join(", ");
       }
-
-      // typeform-like choices
       if (f?.choices?.labels?.length) return f.choices.labels.join(", ");
-
-      // fallback
       return (v === undefined || v === null) ? "" : String(v);
     };
 
@@ -99,18 +91,16 @@ export default async function handler(req, res) {
       if (!obj || typeof obj !== "object") return;
       const d = obj.data || obj;
 
-      // Tally v2: data.fields[] with { key, label, value, options/choices }
       if (Array.isArray(d.fields)) {
         for (const f of d.fields) {
           const label = f.label || f.key || f.id || "";
           const val = toLabel(f);
           set(label, val);
-          if (f.key) set(f.key, val);
-          if (f.id) set(f.id, val);
+          if (f.key) set(`${f.key}_raw`, val);
+          if (f.id) set(`${f.id}_raw`, val);
         }
       }
 
-      // answers[] variants
       const answers = d.answers || d.form_response?.answers || [];
       if (Array.isArray(answers)) {
         for (const a of answers) {
@@ -121,15 +111,13 @@ export default async function handler(req, res) {
             (a.choices && (a.choices.labels?.join(", ") || a.choices.values?.join(", "))) ||
             a.value || a.answer || JSON.stringify(a);
           set(label, val);
-          if (a.field?.id) set(a.field.id, val);
+          if (a.field?.id) set(`${a.field.id}_raw`, val);
         }
       }
 
-      // hidden params
       const hidden = d.hidden || d.meta?.hidden || {};
       for (const [k, v] of Object.entries(hidden)) set(k, v);
 
-      // copy any top-level primitives
       for (const [k, v] of Object.entries(d)) {
         if (v && typeof v !== "object") set(k, v);
       }
@@ -138,6 +126,13 @@ export default async function handler(req, res) {
     walk(payload);
     return flat;
   }
+
+  // small helpers
+  const cleanPhone = p => (p || "").replace(/[^+0-9]/g, "");
+  const toInt = v => {
+    const n = parseInt(String(v ?? "").replace(/[^0-9]/g, ""), 10);
+    return Number.isFinite(n) ? n : undefined;
+  };
 
   try {
     const base = process.env.B24_WEBHOOK_BASE; // https://.../rest/<USER>/<TOKEN>[/]
@@ -153,36 +148,50 @@ export default async function handler(req, res) {
       return "";
     };
 
-    // Core customer and order fields
-    const firstName = pick("firstName", "first_name");
-    const lastName  = pick("lastName", "last_name");
-    const fullName  = pick("fullName", "full_name", "your_name", "name");
-    const email     = pick("email", "your_email");
-    const phone     = pick("phone", "phone_number", "your_phone");
-    const province  = pick("province", "state", "province_state", "region");
-    const city      = pick("city", "your_city", "location_city", "billing_city") || pick("location");
+    // Map exact fields to mirror the email
+    // Primary item
+    const containerType1 = pick("container type", "container_type", "container size");
+    const quantity1      = toInt(pick("quantity", "quantity_1", "qty", "count"));
 
-    const containerType = pick("container type", "container_type", "container", "container size", "type");
-    const quantity      = pick("quantity", "qty", "count");
+    // Optional second item
+    const containerType2 = pick("add a second container type to this order", "add_a_second_container_type_to_this_order", "container type 2", "second container type");
+    const quantity2      = toInt(flat["quantity_2"]) || toInt(flat["quantity_3"]) || toInt(flat["quantity_4"]) || toInt(flat["quantity_5"]);
+
+    const orderComments = pick("comments", "order_comments");
+
+    const name          = pick("name", "full_name", "fullName");
+    const email         = pick("email", "your_email");
+    const phone         = cleanPhone(pick("phone number", "phone_number", "phone", "your_phone"));
+
     const billingAddr   = pick("billing address", "billing_address", "address");
+    const province      = pick("province", "province_state");
+    const city          = pick("city", "billing_city");
 
-    // Delivery / Pickup specifics
-    const method        = (pick("method", "delivery_method", "ship_method") || "").toLowerCase(); // "pickup" or "delivery"
-    const pickupDepot   = pick("location", "pickup_location", "depot", "pickup depot", "pickup_branch");
-    const doorsDirection= pick("container doors direction for pickup", "doors_direction", "doors");
+    const methodRaw     = pick("method", "delivery_method");
+    const method        = (methodRaw || "").toLowerCase() === "delivery" ? "delivery" : (methodRaw || "").toLowerCase() === "pickup" ? "pickup" : (methodRaw || "").toLowerCase();
+
+    const deliveryAddress = pick("delivery address/map pin/coordinates", "delivery_address", "delivery_location", "map pin", "map_pin", "coordinates");
+
+    // Pickup specific
+    const doorsPickupRaw = pick("container doors direction for pickup", "doors_direction_for_pickup", "doors_direction_pickup", "doors_direction");
+    const doorsDirection = (() => {
+      const v = (doorsPickupRaw || "").toString().toLowerCase();
+      if (!v) return "";
+      if (["cab", "to_cab", "doors_to_cab", "front", "doors to the cab"].includes(v)) return "Doors to the Cab";
+      if (["back", "to_back", "doors_to_back", "rear", "doors to the back"].includes(v)) return "Doors to the Back";
+      return doorsPickupRaw;
+    })();
+
+    // Delivery specific
     const siteName      = pick("site contact name", "site_name", "sitecontactname");
-    const sitePhone     = pick("site contact phone number", "site_phone", "sitecontactphone");
-    const deliveryNotes = pick("delivery comments", "delivery_notes", "deliverycomments");
-
-    const message       = pick("comments", "message", "notes", "description", "order_comments");
+    const sitePhone     = cleanPhone(pick("site contact phone number", "site_phone", "sitecontactphone"));
+    const deliveryNotes = pick("delivery comments", "delivery_comments", "delivery_notes");
 
     const utm_source    = pick("utm_source");
     const utm_medium    = pick("utm_medium");
     const utm_campaign  = pick("utm_campaign");
     const utm_term      = pick("utm_term");
     const utm_content   = pick("utm_content");
-
-    const name = fullName || [firstName, lastName].filter(Boolean).join(" ").trim() || (phone ? "Caller" : "Visitor");
 
     // Bitrix helper
     const b24 = (methodName, params) => {
@@ -196,70 +205,78 @@ export default async function handler(req, res) {
 
     // 1) Find or create contact
     let contactId = null;
-    if (email) {
-      const byEmail = await b24("crm.contact.list", { filter: { EMAIL: email }, select: ["ID"] });
+    const searchEmail = email?.trim();
+    const searchPhone = phone?.trim();
+
+    if (searchEmail) {
+      const byEmail = await b24("crm.contact.list", { filter: { EMAIL: searchEmail }, select: ["ID"] });
       contactId = byEmail?.result?.[0]?.ID || null;
     }
-    if (!contactId && phone) {
-      const byPhone = await b24("crm.contact.list", { filter: { PHONE: phone }, select: ["ID"] });
+    if (!contactId && searchPhone) {
+      const byPhone = await b24("crm.contact.list", { filter: { PHONE: searchPhone }, select: ["ID"] });
       contactId = byPhone?.result?.[0]?.ID || null;
     }
-    if (!contactId && (email || phone)) {
+    if (!contactId && (searchEmail || searchPhone)) {
       const contactCreate = await b24("crm.contact.add", {
         fields: {
-          NAME: name,
+          NAME: name || (searchPhone ? "Caller" : "Visitor"),
           OPENED: "Y",
-          EMAIL: email ? [{ VALUE: email, VALUE_TYPE: "WORK" }] : [],
-          PHONE: phone ? [{ VALUE: phone, VALUE_TYPE: "WORK" }] : []
+          EMAIL: searchEmail ? [{ VALUE: searchEmail, VALUE_TYPE: "WORK" }] : [],
+          PHONE: searchPhone ? [{ VALUE: searchPhone, VALUE_TYPE: "WORK" }] : []
         }
       });
       if (contactCreate?.result) contactId = contactCreate.result;
     }
 
-    // 2) Build detailed comments
+    // 2) Compose comments block to mirror the email layout
     const lines = [];
     lines.push("Form: invoice request");
 
-    if (containerType || quantity) lines.push(`Order: ${[containerType, quantity && `x${quantity}`].filter(Boolean).join(" ")}`);
-    if (billingAddr) lines.push(`Billing address: ${billingAddr}`);
-    if (province || city) lines.push(`Location: ${[city, province].filter(Boolean).join(", ")}`);
+    if (containerType1) { lines.push(""); lines.push("Container type"); lines.push(containerType1); }
+    if (quantity1)      { lines.push(""); lines.push("Quantity"); lines.push(String(quantity1)); }
 
-    if (method === "pickup") {
-      lines.push("Method: Pickup");
-      if (pickupDepot) lines.push(`Pickup depot: ${pickupDepot}`);
-      if (doorsDirection) lines.push(`Doors direction: ${doorsDirection}`);
-    } else if (method === "delivery") {
-      lines.push("Method: Delivery");
-      if (siteName)  lines.push(`Site contact: ${siteName}`);
-      if (sitePhone) lines.push(`Site contact phone: ${sitePhone}`);
-      if (doorsDirection) lines.push(`Doors direction: ${doorsDirection}`);
-      if (deliveryNotes) lines.push(`Delivery notes: ${deliveryNotes}`);
-    } else if (method) {
-      lines.push(`Method: ${method}`);
-    }
+    if (containerType2) { lines.push(""); lines.push("Add a second container type to this order"); lines.push(containerType2); }
+    if (quantity2)      { lines.push(""); lines.push("Quantity"); lines.push(String(quantity2)); }
 
-    if (message) lines.push(`Message: ${message}`);
-    if (email)   lines.push(`Email: ${email}`);
-    if (phone)   lines.push(`Phone: ${phone}`);
+    if (orderComments)  { lines.push(""); lines.push("Comments"); lines.push(orderComments); }
+
+    if (name)           { lines.push(""); lines.push("Name"); lines.push(name); }
+    if (email)          { lines.push(""); lines.push("Email"); lines.push(email); }
+    if (phone)          { lines.push(""); lines.push("Phone number"); lines.push(phone); }
+
+    if (billingAddr)    { lines.push(""); lines.push("Billing address"); lines.push(billingAddr); }
+    if (province)       { lines.push(""); lines.push("Province"); lines.push(province); }
+    if (city)           { lines.push(""); lines.push("City"); lines.push(city); }
+
+    if (method)         { lines.push(""); lines.push("Method"); lines.push(method.charAt(0).toUpperCase() + method.slice(1)); }
+
+    if (deliveryAddress){ lines.push(""); lines.push("Delivery address/Map Pin/Coordinates"); lines.push(deliveryAddress); }
+
+    if (doorsDirection) { lines.push(""); lines.push("Container doors direction for pickup"); lines.push(doorsDirection); }
+
+    if (siteName)       { lines.push(""); lines.push("Site contact name"); lines.push(siteName); }
+    if (sitePhone)      { lines.push(""); lines.push("Site contact phone number"); lines.push(sitePhone); }
+
+    if (deliveryNotes)  { lines.push(""); lines.push("Delivery comments"); lines.push(deliveryNotes); }
 
     if (utm_source || utm_medium || utm_campaign || utm_term || utm_content) {
-      lines.push(
-        `UTM: source=${utm_source || ""}, medium=${utm_medium || ""}, campaign=${utm_campaign || ""}, term=${utm_term || ""}, content=${utm_content || ""}`
-      );
+      lines.push("");
+      lines.push("UTM");
+      lines.push(`source=${utm_source || ""}, medium=${utm_medium || ""}, campaign=${utm_campaign || ""}, term=${utm_term || ""}, content=${utm_content || ""}`);
     }
 
     const comments = lines.join("\n");
 
-    // 3) Create deal in Invoice pipeline (env-driven)
+    // 3) Create deal in Invoice pipeline
     const CATEGORY_ID = Number(process.env.INVOICE_CATEGORY_ID ?? process.env.QUOTE_CATEGORY_ID ?? 6);
     const STAGE_ID = process.env.INVOICE_STAGE_ID ?? process.env.QUOTE_STAGE_ID ?? (CATEGORY_ID === 0 ? "NEW" : `C${CATEGORY_ID}:NEW`);
     const assignedById = Number(process.env.QUOTE_ASSIGNED_BY_ID || process.env.ASSIGNED_BY_ID || 0);
     const sourceId     = process.env.QUOTE_SOURCE_ID || process.env.DEAL_SOURCE_ID || "WEB";
 
     const titleBits = [
-      containerType || "Invoice request",
-      quantity && `x${quantity}`,
-      city || province
+      containerType1 || "Invoice request",
+      quantity1 ? `x${quantity1}` : null,
+      city || province || null
     ].filter(Boolean).join(" | ");
 
     const dealAdd = await b24("crm.deal.add", {
