@@ -1,6 +1,6 @@
-// /api/quote-to-deal.js
+// /api/quote-to-deal.js  — INVOICE REQUEST (Invoice pipeline)
 export default async function handler(req, res) {
-    // CORS allow-list
+  // CORS allow-list
   const originHeader = req.headers.origin || "";
   const allowedList = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || "*")
     .split(",").map(s => s.trim()).filter(Boolean);
@@ -16,7 +16,12 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  if (req.method !== "POST" && req.method !== "GET") {
+  if (req.method === "GET") {
+    res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+    return res.status(200).json({ ok: true, method: "GET", stage: "stub-get" });
+  }
+
+  if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
@@ -34,99 +39,105 @@ export default async function handler(req, res) {
     }
   }
 
-  if (req.method === "GET") {
-    return res.status(200).json({ ok: true, method: "GET", stage: "stub-get" });
-  }
-
-  if (req.method === 'GET') {
-    return res.status(200).json({ ok: true, method: 'GET', stage: 'stub-get' });
-  }
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed' });
-  }
-
   try {
-    const base = process.env.B24_WEBHOOK_BASE; // https://.../rest/USER/TOKEN
-    if (!base) return res.status(500).json({ error: 'Missing B24_WEBHOOK_BASE' });
+    const base = process.env.B24_WEBHOOK_BASE; // https://.../rest/USER/TOKEN/
+    if (!base) return res.status(500).json({ error: "Missing B24_WEBHOOK_BASE" });
 
-    const {
-      name = '',
-      email = '',
-      phone = '',
-      message = '',
-      city = '',
-      province = '',
-      container_size = '',
-      condition = '',
-      page_url = '',
-      utm_source, utm_medium, utm_campaign, utm_term, utm_content
-    } = req.body || {};
+    const b = await readBody(req);
+    const get = k => (b?.[k] ?? "").toString();
 
-    // helper
-    const b24 = (method, params) =>
-      fetch(`${base}/${method}.json`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+    // Normalized fields
+    const name           = get("name") || get("fullName") ||
+                           [get("firstName"), get("lastName")].filter(Boolean).join(" ").trim() ||
+                           (get("phone") ? "Caller" : "Visitor");
+    const email          = get("email");
+    const phone          = get("phone");
+    const message        = get("message");
+    const city           = get("city") || get("location");
+    const province       = get("province") || get("state");
+    const container_size = get("container_size") || get("containerSize") || get("size");
+    const condition      = get("condition");
+    const page_url       = get("page_url") || get("page");
+    const utm_source     = get("utm_source");
+    const utm_medium     = get("utm_medium");
+    const utm_campaign   = get("utm_campaign");
+    const utm_term       = get("utm_term");
+    const utm_content    = get("utm_content");
+
+    // Helper: safe Bitrix call (handles trailing slash)
+    const b24 = (method, params) => {
+      const endpoint = base.endsWith("/") ? `${base}${method}.json` : `${base}/${method}.json`;
+      return fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(params || {})
       }).then(r => r.json());
-
-    // 1) find or create contact (only if we have email or phone)
-    let contactId = null;
-
-    const tryFind = async () => {
-      if (email) {
-        const byEmail = await b24('crm.contact.list', { filter: { 'EMAIL': email }, select: ['ID'] });
-        if (byEmail?.result?.[0]?.ID) return byEmail.result[0].ID;
-      }
-      if (phone) {
-        const byPhone = await b24('crm.contact.list', { filter: { 'PHONE': phone }, select: ['ID'] });
-        if (byPhone?.result?.[0]?.ID) return byPhone.result[0].ID;
-      }
-      return null;
     };
 
-    contactId = await tryFind();
+    // 1) Find or create contact
+    let contactId = null;
+
+    if (email) {
+      const byEmail = await b24("crm.contact.list", { filter: { EMAIL: email }, select: ["ID"] });
+      contactId = byEmail?.result?.[0]?.ID || null;
+    }
+    if (!contactId && phone) {
+      const byPhone = await b24("crm.contact.list", { filter: { PHONE: phone }, select: ["ID"] });
+      contactId = byPhone?.result?.[0]?.ID || null;
+    }
 
     if (!contactId && (email || phone)) {
-      const contactCreate = await b24('crm.contact.add', {
+      const contactCreate = await b24("crm.contact.add", {
         fields: {
-          NAME: name || (phone ? 'Caller' : 'Visitor'),
-          OPENED: 'Y',
-          EMAIL: email ? [{ VALUE: email, VALUE_TYPE: 'WORK' }] : undefined,
-          PHONE: phone ? [{ VALUE: phone, VALUE_TYPE: 'WORK' }] : undefined
+          NAME: name,
+          OPENED: "Y",
+          EMAIL: email ? [{ VALUE: email, VALUE_TYPE: "WORK" }] : [],
+          PHONE: phone ? [{ VALUE: phone, VALUE_TYPE: "WORK" }] : []
         }
       });
       if (contactCreate?.result) contactId = contactCreate.result;
     }
 
-    // 2) build comments
+    // 2) Build comments
     const comments = [
-      `Form: quote / call request`,
+      "Form: invoice request",
       message && `Message: ${message}`,
       container_size && `Container: ${container_size}`,
       condition && `Condition: ${condition}`,
-      city && province && `Location: ${city}, ${province}`,
+      city || province ? `Location: ${[city, province].filter(Boolean).join(", ")}` : "",
       email && `Email: ${email}`,
       phone && `Phone: ${phone}`,
       page_url && `Page: ${page_url}`,
       (utm_source || utm_medium || utm_campaign || utm_term || utm_content) &&
-        `UTM: source=${utm_source || ''}, medium=${utm_medium || ''}, campaign=${utm_campaign || ''}, term=${utm_term || ''}, content=${utm_content || ''}`
-    ].filter(Boolean).join('\n');
+        `UTM: source=${utm_source || ""}, medium=${utm_medium || ""}, campaign=${utm_campaign || ""}, term=${utm_term || ""}, content=${utm_content || ""}`
+    ].filter(Boolean).join("\n");
 
-    // 3) create deal in Category 0, Stage C0:NEW
-    const CATEGORY_ID = 0;         // the board you showed
-    const STAGE_ID = 'C0:NEW';     // first column
+    // 3) Create deal in Invoice pipeline (env-driven)
+    const CATEGORY_ID = Number(
+      process.env.INVOICE_CATEGORY_ID ??
+      process.env.QUOTE_CATEGORY_ID ?? 6
+    );
+    const STAGE_ID =
+      process.env.INVOICE_STAGE_ID ??
+      process.env.QUOTE_STAGE_ID ??
+      (CATEGORY_ID === 0 ? "NEW" : `C${CATEGORY_ID}:NEW`);
 
-    const titleBits = [name || phone || 'Quote request', container_size || '', city || province || '']
+    const assignedById = Number(process.env.QUOTE_ASSIGNED_BY_ID || process.env.ASSIGNED_BY_ID || 0);
+    const sourceId     = process.env.QUOTE_SOURCE_ID || process.env.DEAL_SOURCE_ID || "WEB";
+
+    const titleBits = [name || phone || "Invoice request", container_size || "", city || province || ""]
       .filter(Boolean)
-      .join(' | ');
+      .join(" | ");
 
-    const dealAdd = await b24('crm.deal.add', {
+    const dealAdd = await b24("crm.deal.add", {
       fields: {
-        TITLE: `Quote Request: ${titleBits}`.slice(0, 250),
-        CATEGORY_ID,
-        STAGE_ID,
+        TITLE: `Invoice Request: ${titleBits}`.slice(0, 250),
+        CATEGORY_ID: CATEGORY_ID,
+        STAGE_ID: STAGE_ID,
+        ASSIGNED_BY_ID: assignedById || undefined,
         CONTACT_ID: contactId || undefined,
+        SOURCE_ID: sourceId,
+        SOURCE_DESCRIPTION: "new.storecan.ca",
         COMMENTS: comments
       }
     });
@@ -134,8 +145,9 @@ export default async function handler(req, res) {
     if (dealAdd?.result) {
       return res.status(200).json({ ok: true, deal_id: dealAdd.result });
     }
-    return res.status(500).json({ error: 'Failed to create deal', raw: dealAdd });
+    return res.status(500).json({ error: "Failed to create deal", raw: dealAdd });
   } catch (e) {
-    return res.status(500).json({ error: e?.message || 'Server error' });
+    console.error(e);
+    return res.status(500).json({ error: e?.message || "Server error" });
   }
 }
