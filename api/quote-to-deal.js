@@ -47,10 +47,13 @@ export default async function handler(req, res) {
     .replace(/[^a-z0-9]+/g, "_")
     .replace(/^_+|_+$/g, "");
 
-  // best effort form flattener, supports duplicate labels (e.g., two "Quantity")
+  const looksLikeUUID = v => typeof v === "string" && /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(v);
+
+  // best-effort flattener that resolves choice IDs to human labels
   function toFlat(payload) {
     const flat = {};
     const counts = {};
+
     const set = (key, val) => {
       if (val === undefined || val === null || val === "") return;
       let k = norm(key);
@@ -63,27 +66,37 @@ export default async function handler(req, res) {
       flat[k] = typeof val === "string" ? val : JSON.stringify(val);
     };
 
+    // try to resolve a field's value into a readable label
     const toLabel = (f) => {
       let v = f?.value;
+
+      // arrays
       if (Array.isArray(v)) {
         const labels = v.map(x => (x && typeof x === "object")
-          ? (x.label || x.name || x.text || x.value || x.choice || x.email || x.phone)
+          ? (x.label || x.name || x.text || x.value || x.choice)
           : x).filter(Boolean);
         if (labels.length) return labels.join(", ");
       }
+
+      // single object
       if (v && typeof v === "object") {
-        return v.label || v.name || v.text || v.value || v.choice || v.email || v.phone || JSON.stringify(v);
+        return v.label || v.name || v.text || v.value || v.choice || JSON.stringify(v);
       }
-      const opts = f?.options?.choices || f?.options || f?.choices || [];
-      if (opts && v) {
-        const asArray = Array.isArray(v) ? v : [v];
-        const labels = asArray.map(id => {
-          const hit = opts.find(o => o?.id === id || o?.key === id || o?.value === id || o === id);
-          return hit?.label || hit?.name || hit?.value || hit || id;
-        }).filter(Boolean);
-        if (labels.length) return labels.join(", ");
+
+      // value may be an id, with choices listed separately
+      const allChoices = f?.options?.choices || f?.options || f?.choices || [];
+      if (allChoices && (v || v === 0)) {
+        const id = Array.isArray(v) ? v[0] : v;
+        const hit = allChoices.find(o =>
+          o?.id === id || o?.value === id || o?.key === id || o === id
+        );
+        if (hit) return hit.label || hit.name || hit.value || String(id);
       }
-      if (f?.choices?.labels?.length) return f.choices.labels.join(", ");
+
+      // if value looks like UUID and we have a text label on field, prefer that
+      if (looksLikeUUID(v) && f?.label) return f.label;
+
+      // fallback to raw text
       return (v === undefined || v === null) ? "" : String(v);
     };
 
@@ -91,33 +104,34 @@ export default async function handler(req, res) {
       if (!obj || typeof obj !== "object") return;
       const d = obj.data || obj;
 
+      // Tally style: data.fields[]
       if (Array.isArray(d.fields)) {
         for (const f of d.fields) {
           const label = f.label || f.key || f.id || "";
           const val = toLabel(f);
           set(label, val);
-          if (f.key) set(`${f.key}_raw`, val);
-          if (f.id) set(`${f.id}_raw`, val);
+          // keep raw too for debugging if different
+          if (val !== f?.value && (typeof f?.value === "string" || typeof f?.value === "number")) set(`${label} (raw)`, String(f.value));
         }
       }
 
+      // Typeform style answers[]
       const answers = d.answers || d.form_response?.answers || [];
       if (Array.isArray(answers)) {
         for (const a of answers) {
-          const label = a.field?.label || a.field?.id || a.label || a.id || "";
-          const val =
-            a.email || a.phone || a.text ||
+          const label = a.field?.label || a.label || a.id || "";
+          const val = a.email || a.phone || a.text ||
             (a.choice && (a.choice.label || a.choice.value)) ||
             (a.choices && (a.choices.labels?.join(", ") || a.choices.values?.join(", "))) ||
-            a.value || a.answer || JSON.stringify(a);
+            a.value || a.answer || "";
           set(label, val);
-          if (a.field?.id) set(`${a.field.id}_raw`, val);
         }
       }
 
       const hidden = d.hidden || d.meta?.hidden || {};
       for (const [k, v] of Object.entries(hidden)) set(k, v);
 
+      // copy any top-level primitives
       for (const [k, v] of Object.entries(d)) {
         if (v && typeof v !== "object") set(k, v);
       }
@@ -127,7 +141,6 @@ export default async function handler(req, res) {
     return flat;
   }
 
-  // small helpers
   const cleanPhone = p => (p || "").replace(/[^+0-9]/g, "");
   const toInt = v => {
     const n = parseInt(String(v ?? "").replace(/[^0-9]/g, ""), 10);
@@ -135,7 +148,7 @@ export default async function handler(req, res) {
   };
 
   try {
-    const base = process.env.B24_WEBHOOK_BASE; // https://.../rest/<USER>/<TOKEN>[/]
+    const base = process.env.B24_WEBHOOK_BASE;
     if (!base) return res.status(500).json({ error: "Missing B24_WEBHOOK_BASE" });
 
     const raw = await readBody(req);
@@ -148,50 +161,40 @@ export default async function handler(req, res) {
       return "";
     };
 
-    // Map exact fields to mirror the email
-    // Primary item
+    // Map exactly to the email content
     const containerType1 = pick("container type", "container_type", "container size");
     const quantity1      = toInt(pick("quantity", "quantity_1", "qty", "count"));
 
-    // Optional second item
     const containerType2 = pick("add a second container type to this order", "add_a_second_container_type_to_this_order", "container type 2", "second container type");
-    const quantity2      = toInt(flat["quantity_2"]) || toInt(flat["quantity_3"]) || toInt(flat["quantity_4"]) || toInt(flat["quantity_5"]);
+    const quantity2      = toInt(flat["quantity_2"]) || toInt(flat["quantity_3"]) || toInt(flat["quantity_4"]) || undefined;
 
-    const orderComments = pick("comments", "order_comments");
+    const orderComments  = pick("comments", "order_comments");
+    const name           = pick("name", "full_name");
+    const email          = pick("email", "your_email");
+    const phone          = cleanPhone(pick("phone number", "phone_number", "phone"));
 
-    const name          = pick("name", "full_name", "fullName");
-    const email         = pick("email", "your_email");
-    const phone         = cleanPhone(pick("phone number", "phone_number", "phone", "your_phone"));
+    const billingAddr    = pick("billing address", "billing_address");
+    const province       = pick("province", "province_state");
+    const city           = pick("city", "billing_city");
 
-    const billingAddr   = pick("billing address", "billing_address", "address");
-    const province      = pick("province", "province_state");
-    const city          = pick("city", "billing_city");
+    const methodRaw      = pick("method", "delivery_method");
+    const method         = (methodRaw || "").toLowerCase() === "delivery" ? "Delivery" : (methodRaw || "").toLowerCase() === "pickup" ? "Pickup" : methodRaw;
 
-    const methodRaw     = pick("method", "delivery_method");
-    const method        = (methodRaw || "").toLowerCase() === "delivery" ? "delivery" : (methodRaw || "").toLowerCase() === "pickup" ? "pickup" : (methodRaw || "").toLowerCase();
+    const deliveryAddr   = pick("delivery address/map pin/coordinates", "delivery_address", "map pin", "map_pin", "coordinates");
 
-    const deliveryAddress = pick("delivery address/map pin/coordinates", "delivery_address", "delivery_location", "map pin", "map_pin", "coordinates");
-
-    // Pickup specific
-    const doorsPickupRaw = pick("container doors direction for pickup", "doors_direction_for_pickup", "doors_direction_pickup", "doors_direction");
+    const doorsRaw       = pick("container doors direction for pickup", "doors_direction_for_pickup", "doors_direction");
     const doorsDirection = (() => {
-      const v = (doorsPickupRaw || "").toString().toLowerCase();
+      const v = (doorsRaw || "").toString().toLowerCase();
       if (!v) return "";
-      if (["cab", "to_cab", "doors_to_cab", "front", "doors to the cab"].includes(v)) return "Doors to the Cab";
-      if (["back", "to_back", "doors_to_back", "rear", "doors to the back"].includes(v)) return "Doors to the Back";
-      return doorsPickupRaw;
+      if (looksLikeUUID(doorsRaw)) return ""; // avoid dumping UUID if mapping failed
+      if (["doors to the cab", "cab", "front", "to_cab", "doors_to_cab"].includes(v)) return "Doors to the Cab";
+      if (["doors to the back", "back", "rear", "to_back", "doors_to_back"].includes(v)) return "Doors to the Back";
+      return doorsRaw;
     })();
 
-    // Delivery specific
-    const siteName      = pick("site contact name", "site_name", "sitecontactname");
-    const sitePhone     = cleanPhone(pick("site contact phone number", "site_phone", "sitecontactphone"));
-    const deliveryNotes = pick("delivery comments", "delivery_comments", "delivery_notes");
-
-    const utm_source    = pick("utm_source");
-    const utm_medium    = pick("utm_medium");
-    const utm_campaign  = pick("utm_campaign");
-    const utm_term      = pick("utm_term");
-    const utm_content   = pick("utm_content");
+    const siteName       = pick("site contact name", "site_name");
+    const sitePhone      = cleanPhone(pick("site contact phone number", "site_phone"));
+    const deliveryNotes  = pick("delivery comments", "delivery_comments", "delivery_notes");
 
     // Bitrix helper
     const b24 = (methodName, params) => {
@@ -205,37 +208,34 @@ export default async function handler(req, res) {
 
     // 1) Find or create contact
     let contactId = null;
-    const searchEmail = email?.trim();
-    const searchPhone = phone?.trim();
-
-    if (searchEmail) {
-      const byEmail = await b24("crm.contact.list", { filter: { EMAIL: searchEmail }, select: ["ID"] });
+    if (email) {
+      const byEmail = await b24("crm.contact.list", { filter: { EMAIL: email }, select: ["ID"] });
       contactId = byEmail?.result?.[0]?.ID || null;
     }
-    if (!contactId && searchPhone) {
-      const byPhone = await b24("crm.contact.list", { filter: { PHONE: searchPhone }, select: ["ID"] });
+    if (!contactId && phone) {
+      const byPhone = await b24("crm.contact.list", { filter: { PHONE: phone }, select: ["ID"] });
       contactId = byPhone?.result?.[0]?.ID || null;
     }
-    if (!contactId && (searchEmail || searchPhone)) {
+    if (!contactId && (email || phone)) {
       const contactCreate = await b24("crm.contact.add", {
         fields: {
-          NAME: name || (searchPhone ? "Caller" : "Visitor"),
+          NAME: name || (phone ? "Caller" : "Visitor"),
           OPENED: "Y",
-          EMAIL: searchEmail ? [{ VALUE: searchEmail, VALUE_TYPE: "WORK" }] : [],
-          PHONE: searchPhone ? [{ VALUE: searchPhone, VALUE_TYPE: "WORK" }] : []
+          EMAIL: email ? [{ VALUE: email, VALUE_TYPE: "WORK" }] : [],
+          PHONE: phone ? [{ VALUE: phone, VALUE_TYPE: "WORK" }] : []
         }
       });
       if (contactCreate?.result) contactId = contactCreate.result;
     }
 
-    // 2) Compose comments block to mirror the email layout
+    // 2) Compose comments exactly like the email snapshot
     const lines = [];
     lines.push("Form: invoice request");
 
-    if (containerType1) { lines.push(""); lines.push("Container type"); lines.push(containerType1); }
+    if (containerType1 && !looksLikeUUID(containerType1)) { lines.push(""); lines.push("Container type"); lines.push(containerType1); }
     if (quantity1)      { lines.push(""); lines.push("Quantity"); lines.push(String(quantity1)); }
 
-    if (containerType2) { lines.push(""); lines.push("Add a second container type to this order"); lines.push(containerType2); }
+    if (containerType2 && !looksLikeUUID(containerType2)) { lines.push(""); lines.push("Add a second container type to this order"); lines.push(containerType2); }
     if (quantity2)      { lines.push(""); lines.push("Quantity"); lines.push(String(quantity2)); }
 
     if (orderComments)  { lines.push(""); lines.push("Comments"); lines.push(orderComments); }
@@ -245,12 +245,12 @@ export default async function handler(req, res) {
     if (phone)          { lines.push(""); lines.push("Phone number"); lines.push(phone); }
 
     if (billingAddr)    { lines.push(""); lines.push("Billing address"); lines.push(billingAddr); }
-    if (province)       { lines.push(""); lines.push("Province"); lines.push(province); }
+    if (province && !looksLikeUUID(province)) { lines.push(""); lines.push("Province"); lines.push(province); }
     if (city)           { lines.push(""); lines.push("City"); lines.push(city); }
 
-    if (method)         { lines.push(""); lines.push("Method"); lines.push(method.charAt(0).toUpperCase() + method.slice(1)); }
+    if (method && !looksLikeUUID(method)) { lines.push(""); lines.push("Method"); lines.push(method); }
 
-    if (deliveryAddress){ lines.push(""); lines.push("Delivery address/Map Pin/Coordinates"); lines.push(deliveryAddress); }
+    if (deliveryAddr)   { lines.push(""); lines.push("Delivery address/Map Pin/Coordinates"); lines.push(deliveryAddr); }
 
     if (doorsDirection) { lines.push(""); lines.push("Container doors direction for pickup"); lines.push(doorsDirection); }
 
@@ -259,36 +259,31 @@ export default async function handler(req, res) {
 
     if (deliveryNotes)  { lines.push(""); lines.push("Delivery comments"); lines.push(deliveryNotes); }
 
-    if (utm_source || utm_medium || utm_campaign || utm_term || utm_content) {
-      lines.push("");
-      lines.push("UTM");
-      lines.push(`source=${utm_source || ""}, medium=${utm_medium || ""}, campaign=${utm_campaign || ""}, term=${utm_term || ""}, content=${utm_content || ""}`);
-    }
-
-    const comments = lines.join("\n");
+    const commentsBlock = lines.join("
+");
 
     // 3) Create deal in Invoice pipeline
-    const CATEGORY_ID = Number(process.env.INVOICE_CATEGORY_ID ?? process.env.QUOTE_CATEGORY_ID ?? 6);
-    const STAGE_ID = process.env.INVOICE_STAGE_ID ?? process.env.QUOTE_STAGE_ID ?? (CATEGORY_ID === 0 ? "NEW" : `C${CATEGORY_ID}:NEW`);
+    const CATEGORY_ID = Number(process.env.INVOICE_CATEGORY_ID ?? 6);
+    const STAGE_ID = process.env.INVOICE_STAGE_ID ?? `C${CATEGORY_ID}:NEW`;
     const assignedById = Number(process.env.QUOTE_ASSIGNED_BY_ID || process.env.ASSIGNED_BY_ID || 0);
-    const sourceId     = process.env.QUOTE_SOURCE_ID || process.env.DEAL_SOURCE_ID || "WEB";
+    const sourceId     = process.env.QUOTE_SOURCE_ID || "WEB";
 
     const titleBits = [
-      containerType1 || "Invoice request",
+      containerType1 && !looksLikeUUID(containerType1) ? containerType1 : "Invoice request",
       quantity1 ? `x${quantity1}` : null,
-      city || province || null
+      city || province
     ].filter(Boolean).join(" | ");
 
     const dealAdd = await b24("crm.deal.add", {
       fields: {
-        TITLE: titleBits.slice(0, 250),
+        TITLE: titleBits.slice(0, 250) || "Invoice request",
         CATEGORY_ID: CATEGORY_ID,
         STAGE_ID: STAGE_ID,
         ASSIGNED_BY_ID: assignedById || undefined,
         CONTACT_ID: contactId || undefined,
         SOURCE_ID: sourceId,
         SOURCE_DESCRIPTION: "new.storecan.ca",
-        COMMENTS: comments
+        COMMENTS: commentsBlock
       }
     });
 
