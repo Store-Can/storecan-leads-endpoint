@@ -39,30 +39,107 @@ export default async function handler(req, res) {
     }
   }
 
+  // Utility: normalize a key into snake_case
+  const norm = s => (s || "")
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+
+  // Utility: flatten many possible webhook shapes into { key: value }
+  function toFlat(payload) {
+    const flat = {};
+
+    // helper to set value under multiple candidate keys
+    const set = (key, val) => {
+      if (val === undefined || val === null || val === "") return;
+      const k = norm(key);
+      if (!flat[k]) flat[k] = typeof val === "string" ? val : JSON.stringify(val);
+    };
+
+    // walk the object for useful shapes
+    const walk = (obj) => {
+      if (!obj || typeof obj !== "object") return;
+
+      // Tally common shapes
+      const d = obj.data || obj;
+
+      // 1) Tally v2: data.fields[] with { key, label, type, value }
+      if (Array.isArray(d.fields)) {
+        for (const f of d.fields) {
+          const label = f.label || f.key || f.id || "";
+          let val = f.value;
+          // some controls nest value types
+          if (val && typeof val === "object") {
+            val = val.email || val.phone || val.text || val.choice || val.name || val.value || val.label || JSON.stringify(val);
+          }
+          set(label, val);
+          set(f.key, val);
+        }
+      }
+
+      // 2) Alternative shapes: data.answers[] or form_response.answers[] (Typeform-like)
+      const answers = d.answers || d.form_response?.answers || [];
+      if (Array.isArray(answers)) {
+        for (const a of answers) {
+          const label = a.field?.label || a.field?.id || a.label || a.id || "";
+          const val = a.email || a.phone || a.text || a.choice?.label || a.value || a.answer || JSON.stringify(a);
+          set(label, val);
+          if (a.field?.id) set(a.field.id, val);
+        }
+      }
+
+      // 3) hidden params
+      const hidden = d.hidden || d.meta?.hidden || {};
+      for (const [k, v] of Object.entries(hidden)) set(k, v);
+
+      // 4) also copy any top-level primitives
+      for (const [k, v] of Object.entries(d)) {
+        if (v && typeof v !== "object") set(k, v);
+      }
+    };
+
+    walk(payload);
+    return flat;
+  }
+
   try {
-    const base = process.env.B24_WEBHOOK_BASE; // https://.../rest/USER/TOKEN/
+    const base = process.env.B24_WEBHOOK_BASE; // https://.../rest/USER/TOKEN[/]
     if (!base) return res.status(500).json({ error: "Missing B24_WEBHOOK_BASE" });
 
-    const b = await readBody(req);
-    const get = k => (b?.[k] ?? "").toString();
+    const raw = await readBody(req);
+    const flat = toFlat(raw);
 
-    // Normalized fields
-    const name           = get("name") || get("fullName") ||
-                           [get("firstName"), get("lastName")].filter(Boolean).join(" ").trim() ||
-                           (get("phone") ? "Caller" : "Visitor");
-    const email          = get("email");
-    const phone          = get("phone");
-    const message        = get("message");
-    const city           = get("city") || get("location");
-    const province       = get("province") || get("state");
-    const container_size = get("container_size") || get("containerSize") || get("size");
-    const condition      = get("condition");
-    const page_url       = get("page_url") || get("page");
-    const utm_source     = get("utm_source");
-    const utm_medium     = get("utm_medium");
-    const utm_campaign   = get("utm_campaign");
-    const utm_term       = get("utm_term");
-    const utm_content    = get("utm_content");
+    // helper to pick the first non-empty value from candidate keys
+    function pick(...cands) {
+      for (const c of cands) {
+        const v = flat[norm(c)];
+        if (v) return v;
+      }
+      return "";
+    }
+
+    // Normalized fields from Tally (and flat JSON fallback)
+    const firstName = pick("firstName", "first_name");
+    const lastName  = pick("lastName", "last_name");
+    const fullName  = pick("fullName", "full_name", "your_name", "name");
+    const phone     = pick("phone", "phone_number", "your_phone");
+    const email     = pick("email", "your_email");
+    const message   = pick("message", "comments", "notes", "description");
+    const city      = pick("city", "your_city", "location_city", "location");
+    const province  = pick("province", "state", "province_state", "region");
+    const size      = pick("container_size", "containerSize", "size", "container", "what_size");
+    const condition = pick("condition", "container_condition");
+    const page_url  = pick("page_url", "page");
+
+    const utm_source   = pick("utm_source");
+    const utm_medium   = pick("utm_medium");
+    const utm_campaign = pick("utm_campaign");
+    const utm_term     = pick("utm_term");
+    const utm_content  = pick("utm_content");
+
+    const name = fullName || [firstName, lastName].filter(Boolean).join(" ").trim() || (phone ? "Caller" : "Visitor");
 
     // Helper: safe Bitrix call (handles trailing slash)
     const b24 = (method, params) => {
@@ -102,9 +179,9 @@ export default async function handler(req, res) {
     const comments = [
       "Form: invoice request",
       message && `Message: ${message}`,
-      container_size && `Container: ${container_size}`,
+      size && `Container: ${size}`,
       condition && `Condition: ${condition}`,
-      city || province ? `Location: ${[city, province].filter(Boolean).join(", ")}` : "",
+      (city || province) && `Location: ${[city, province].filter(Boolean).join(", ")}`,
       email && `Email: ${email}`,
       phone && `Phone: ${phone}`,
       page_url && `Page: ${page_url}`,
@@ -125,7 +202,7 @@ export default async function handler(req, res) {
     const assignedById = Number(process.env.QUOTE_ASSIGNED_BY_ID || process.env.ASSIGNED_BY_ID || 0);
     const sourceId     = process.env.QUOTE_SOURCE_ID || process.env.DEAL_SOURCE_ID || "WEB";
 
-    const titleBits = [name || phone || "Invoice request", container_size || "", city || province || ""]
+    const titleBits = [name || phone || "Invoice request", size || "", city || province || ""]
       .filter(Boolean)
       .join(" | ");
 
