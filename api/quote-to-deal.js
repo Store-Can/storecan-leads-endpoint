@@ -1,6 +1,7 @@
 // /api/quote-to-deal.js – INVOICE REQUEST (Invoice pipeline)
-// Final fix v3: robust ID → Label resolution with three sources, support for third container type,
-// new label "Container door orientation", and reliable quantity parsing for duplicated "Quantity" fields.
+// Final fix v4: container type catalog baked in as canonical labels,
+// three-source ID→label resolution, support for third container type & quantity,
+// and the new label "Container door orientation".
 export default async function handler(req, res) {
   // CORS
   const originHeader = req.headers.origin || "";
@@ -38,15 +39,41 @@ export default async function handler(req, res) {
   const cleanPhone = p => (p || "").replace(/[^+0-9]/g, "");
   const toInt = v => { const n = parseInt(String(v ?? "").replace(/[^0-9]/g, ""), 10); return Number.isFinite(n) ? n : undefined; };
 
+  // Canonical StoreCan container labels from the order form UI
+  const KNOWN_CONTAINER_LABELS = [
+    "20'L x 8'W x 8'6\"H NEW (1 trip)",
+    "20'L x 8'W x 8'6\"H Used [Cargo Worthy]",
+    "40'L x 8'W x 8'6\"H Used [Cargo Worthy]",
+    "40'L x 8'W x 9'6\"H HC Used [Cargo Worthy]",
+    "40'L x 8'W x 9'6\"H HC NEW (1 trip)",
+    "20'L x 8'W x 8'6\"H New (1trip) Double Doors",
+    "20'L x 8'W x 8'6\"H New (1trip) 2 Side Doors",
+    "20'L x 8'W x 8'6\"H New (1trip) Fully Open Side",
+    "40'L x 8'W x 9'6\"H HC New (1trip) Double Doors",
+    "40'L x 8'W x 9'6\"H HC New (1trip) 4 Side Doors",
+    "20'L x 8'W x 8'6\"H Used (Working) Reefer",
+    "40'L x 8'W x 9'6\"H HC Used (Working) Reefer"
+  ];
+  const normalizeLabel = s => (s || "")
+    .toString()
+    .toLowerCase()
+    .replace(/[’']/g, "'")
+    .replace(/[“”"]/g, '"')
+    .replace(/\s+/g, " ")
+    .replace(/\s/g, "")
+    .trim();
+  const CANON_BY_NORM = KNOWN_CONTAINER_LABELS.reduce((acc, lbl) => { acc[normalizeLabel(lbl)] = lbl; return acc; }, {});
+
   // ------------- dictionaries -------------
   const STATIC_MAP = {
     container_type: {
-      "e7ae7ebd-0f39-4584-96a9-5f5154bdbbfb": "40’L x 8’W x 9’6”H HC New (1trip) Double Doors",
-      "681d358d-ca15-49cc-a215-84edf5d08fb3": "40’L x 8’W x 9’6”H HC New (1trip)",
-      "00a288e5-000d-4125-b6ab-bc4a33773912": "40’L x 8’W x 9’6”H HC New (1trip) Double Doors",
-      "32ed3669-a335-4852-870a-abdf2c137df1": "40’L x 8’W x 9’6”H HC New (1trip)",
-      "fc2e9e61-be19-4065-9e5a-9b926e7c5544": "40’ HC New (1trip) Double Doors",
-      "4b9f8044-5102-49a4-8ee0-4487ee1afb3f": "40’ HC New (1trip)"
+      // previously seen UUIDs
+      "e7ae7ebd-0f39-4584-96a9-5f5154bdbbfb": "40'L x 8'W x 9'6\"H HC New (1trip) Double Doors",
+      "681d358d-ca15-49cc-a215-84edf5d08fb3": "40'L x 8'W x 9'6\"H HC New (1trip)",
+      "00a288e5-000d-4125-b6ab-bc4a33773912": "40'L x 8'W x 9'6\"H HC New (1trip) Double Doors",
+      "32ed3669-a335-4852-870a-abdf2c137df1": "40'L x 8'W x 9'6\"H HC New (1trip)",
+      "fc2e9e61-be19-4065-9e5a-9b926e7c5544": "40'L x 8'W x 9'6\"H HC New (1trip) Double Doors",
+      "4b9f8044-5102-49a4-8ee0-4487ee1afb3f": "40'L x 8'W x 9'6\"H HC New (1trip)"
     },
     province: {
       "c1d119fa-2270-4cf8-9055-a4fae3b98b0a": "Alberta",
@@ -71,6 +98,14 @@ export default async function handler(req, res) {
     method:         { ...STATIC_MAP.method,         ...(ENV_MAP.method || {}),         ...DYNAMIC_MAP.method },
     doors_direction:{ ...STATIC_MAP.doors_direction, ...(ENV_MAP.doors_direction || {}), ...DYNAMIC_MAP.doors_direction }
   });
+
+  const resolveContainerLabel = (val, MERGED) => {
+    if (!val) return val;
+    const v = String(val);
+    if (looksLikeUUID(v)) return MERGED.container_type?.[v] || v;
+    const canon = CANON_BY_NORM[normalizeLabel(v)] || v; // snap to canonical spelling
+    return canon;
+  };
 
   const resolveOption = (group, val, MERGED) => {
     if (!val) return val;
@@ -161,11 +196,11 @@ export default async function handler(req, res) {
     const pick = (...c) => { for (const k of c) { const v = flat[norm(k)]; if (v) return v; } return ""; };
 
     // Container types
-    let containerType1 = resolveOption("container_type", pick("container type", "container_type", "container size"), MERGED_MAP);
-    let containerType2 = resolveOption("container_type", pick("add a second container type to this order", "container type 2", "second container type"), MERGED_MAP);
-    let containerType3 = resolveOption("container_type", pick("add a third container type to this order", "add third container type to this order", "container type 3", "third container type"), MERGED_MAP);
+    let containerType1 = resolveContainerLabel(pick("container type", "container_type", "container size"), MERGED_MAP);
+    let containerType2 = resolveContainerLabel(pick("add a second container type to this order", "container type 2", "second container type"), MERGED_MAP);
+    let containerType3 = resolveContainerLabel(pick("add a third container type to this order", "container type 3", "third container type"), MERGED_MAP);
 
-    // Quantities, robust sequencing
+    // Quantities in order of appearance
     const qValsRaw = [flat["quantity"], flat["quantity_2"], flat["quantity_3"], flat["quantity_4"], flat["quantity_5"], flat["quantity_6"]];
     const qVals = qValsRaw.map(v => toInt(v)).filter(v => typeof v === 'number');
     const quantity1 = qVals[0];
@@ -243,8 +278,7 @@ export default async function handler(req, res) {
     if (sitePhone)      { lines.push("", "Site contact phone number", sitePhone); }
     if (deliveryNotes)  { lines.push("", "Delivery comments", deliveryNotes); }
 
-    const comments = lines.join("
-");
+    const comments = lines.join("\n");
 
     // Pipeline
     const CATEGORY_ID = Number(process.env.INVOICE_CATEGORY_ID ?? 6);
