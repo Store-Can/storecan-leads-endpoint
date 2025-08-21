@@ -1,15 +1,13 @@
 // /api/quote-to-deal.js – INVOICE REQUEST (Invoice pipeline)
-// Final v5: resilient container-type capture + third item + new “Container door orientation”.
+// Final fix v4: container type catalog baked in as canonical labels,
+// three-source ID→label resolution, support for third container type & quantity,
+// and the new label "Container door orientation".
 export default async function handler(req, res) {
   // CORS
   const originHeader = req.headers.origin || "";
   const allowedList = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || "*")
     .split(",").map(s => s.trim()).filter(Boolean);
-  const allowOrigin = allowedList.includes("*")
-    ? "*"
-    : allowedList.includes(originHeader)
-    ? originHeader
-    : allowedList[0] || "*";
+  const allowOrigin = allowedList.includes("*") ? "*" : allowedList.includes(originHeader) ? originHeader : (allowedList[0] || "*");
 
   if (req.method === "OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", allowOrigin);
@@ -37,14 +35,11 @@ export default async function handler(req, res) {
     }
   }
   const norm = s => (s || "").toString().trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
-  const looksLikeUUID = v => typeof v === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+  const looksLikeUUID = v => typeof v === "string" && /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
   const cleanPhone = p => (p || "").replace(/[^+0-9]/g, "");
   const toInt = v => { const n = parseInt(String(v ?? "").replace(/[^0-9]/g, ""), 10); return Number.isFinite(n) ? n : undefined; };
 
-  // Optional: show unknown IDs inside comments to make mapping trivial (set to "1" in env if you want to see them)
-  const DEBUG_SHOW_IDS = String(process.env.DEBUG_SHOW_RAW_IDS || "0") === "1";
-
-  // Canonical labels from the website’s dropdown (so small spelling differences still map to a single label)
+  // Canonical StoreCan container labels from the order form UI
   const KNOWN_CONTAINER_LABELS = [
     "20'L x 8'W x 8'6\"H NEW (1 trip)",
     "20'L x 8'W x 8'6\"H Used [Cargo Worthy]",
@@ -69,9 +64,10 @@ export default async function handler(req, res) {
     .trim();
   const CANON_BY_NORM = KNOWN_CONTAINER_LABELS.reduce((acc, lbl) => { acc[normalizeLabel(lbl)] = lbl; return acc; }, {});
 
-  // Static IDs we have seen + doors/province IDs that were reported earlier
+  // ------------- dictionaries -------------
   const STATIC_MAP = {
     container_type: {
+      // previously seen UUIDs
       "e7ae7ebd-0f39-4584-96a9-5f5154bdbbfb": "40'L x 8'W x 9'6\"H HC New (1trip) Double Doors",
       "681d358d-ca15-49cc-a215-84edf5d08fb3": "40'L x 8'W x 9'6\"H HC New (1trip)",
       "00a288e5-000d-4125-b6ab-bc4a33773912": "40'L x 8'W x 9'6\"H HC New (1trip) Double Doors",
@@ -91,11 +87,11 @@ export default async function handler(req, res) {
     }
   };
 
-  // Optional env JSON to add new ID→label pairs without code edits
   let ENV_MAP = {};
   try { ENV_MAP = JSON.parse(process.env.FORM_OPTION_MAP_JSON || "{}"); } catch { ENV_MAP = {}; }
 
   const DYNAMIC_MAP = { container_type: {}, province: {}, method: {}, doors_direction: {} };
+
   const mergeMaps = () => ({
     container_type: { ...STATIC_MAP.container_type, ...(ENV_MAP.container_type || {}), ...DYNAMIC_MAP.container_type },
     province:       { ...STATIC_MAP.province,       ...(ENV_MAP.province || {}),       ...DYNAMIC_MAP.province },
@@ -107,8 +103,10 @@ export default async function handler(req, res) {
     if (!val) return val;
     const v = String(val);
     if (looksLikeUUID(v)) return MERGED.container_type?.[v] || v;
-    return CANON_BY_NORM[normalizeLabel(v)] || v; // snap to canonical spelling
+    const canon = CANON_BY_NORM[normalizeLabel(v)] || v; // snap to canonical spelling
+    return canon;
   };
+
   const resolveOption = (group, val, MERGED) => {
     if (!val) return val;
     const v = String(val);
@@ -116,7 +114,7 @@ export default async function handler(req, res) {
     return MERGED[group]?.[v] || v;
   };
 
-  // Flattener that also harvests choice dictionaries and preserves explicit *_label keys
+  // Flattener that also harvests choice dictionaries
   function toFlatAndChoices(payload) {
     const flat = {};
     const counts = {};
@@ -152,11 +150,8 @@ export default async function handler(req, res) {
         const labels = v.map(x => (x && typeof x === "object") ? (x.label || x.name || x.text || x.value) : x).filter(Boolean);
         if (labels.length) return labels.join(", ");
       }
-      if (v && typeof v === "object") {
-        const lbl = v.label || v.name || v.text || v.value;
-        if (lbl) set(`${f.label || f.key || f.id} label`, lbl);
-        return lbl || JSON.stringify(v);
-      }
+      if (v && typeof v === "object") return v.label || v.name || v.text || v.value || JSON.stringify(v);
+
       if (looksLikeUUID(String(v)) && choicesArr?.length) {
         const hit = choicesArr.find(o => o?.id === v || o?.value === v || o?.key === v);
         if (hit) return hit.label || hit.name || hit.value || String(v);
@@ -167,7 +162,6 @@ export default async function handler(req, res) {
     const walk = (obj) => {
       if (!obj || typeof obj !== "object") return;
       const d = obj.data || obj;
-
       if (Array.isArray(d.fields)) {
         for (const f of d.fields) {
           const label = f.label || f.key || f.id || "";
@@ -179,21 +173,14 @@ export default async function handler(req, res) {
       if (Array.isArray(answers)) {
         for (const a of answers) {
           const label = a.field?.label || a.field?.id || a.label || a.id || "";
-          const val =
-            a.email || a.phone || a.text ||
-            (a.choice && (a.choice.label || a.choice.value)) ||
-            (a.choices && (a.choices.labels?.join(", ") || a.choices.values?.join(", "))) ||
-            a.value || a.answer || "";
+          const val = a.email || a.phone || a.text || (a.choice && (a.choice.label || a.choice.value)) || (a.choices && (a.choices.labels?.join(", ") || a.choices.values?.join(", "))) || a.value || a.answer || "";
           set(label, val);
-          if (a.field?.label && a.text) set(`${a.field.label} label`, a.text);
         }
       }
-
       const hidden = d.hidden || d.meta?.hidden || {};
       for (const [k, v] of Object.entries(hidden)) set(k, v);
       for (const [k, v] of Object.entries(d)) { if (v && typeof v !== "object") set(k, v); }
     };
-
     walk(payload);
     return flat;
   }
@@ -206,50 +193,43 @@ export default async function handler(req, res) {
     const flat = toFlatAndChoices(raw);
     const MERGED_MAP = mergeMaps();
 
-    const pick = (...cand) => { for (const k of cand) { const v = flat[norm(k)]; if (v) return v; } return ""; };
+    const pick = (...c) => { for (const k of c) { const v = flat[norm(k)]; if (v) return v; } return ""; };
 
-    // Prefer explicit label fallbacks if provided by front-end/Tally hidden fields
-    let containerType1 = pick("container type label", "container_type_label", "container type", "container_type", "container size");
-    let containerType2 = pick("add a second container type to this order label", "container type 2 label", "second container type label", "add a second container type to this order", "container type 2", "second container type");
-    let containerType3 = pick("add a third container type to this order label", "container type 3 label", "third container type label", "add a third container type to this order", "container type 3", "third container type");
-
-    // Resolve to canonical labels or via ID maps
-    const unresolvedIds = [];
-    const r1 = resolveContainerLabel(containerType1, MERGED_MAP); if (looksLikeUUID(String(r1))) unresolvedIds.push(["container_type_1", String(r1)]); containerType1 = r1;
-    const r2 = resolveContainerLabel(containerType2, MERGED_MAP); if (looksLikeUUID(String(r2))) unresolvedIds.push(["container_type_2", String(r2)]); containerType2 = r2;
-    const r3 = resolveContainerLabel(containerType3, MERGED_MAP); if (looksLikeUUID(String(r3))) unresolvedIds.push(["container_type_3", String(r3)]); containerType3 = r3;
+    // Container types
+    let containerType1 = resolveContainerLabel(pick("container type", "container_type", "container size"), MERGED_MAP);
+    let containerType2 = resolveContainerLabel(pick("add a second container type to this order", "container type 2", "second container type"), MERGED_MAP);
+    let containerType3 = resolveContainerLabel(pick("add a third container type to this order", "container type 3", "third container type"), MERGED_MAP);
 
     // Quantities in order of appearance
-    const qRaw = [flat["quantity"], flat["quantity_2"], flat["quantity_3"], flat["quantity_4"], flat["quantity_5"], flat["quantity_6"]];
-    const q = qRaw.map(v => toInt(v)).filter(v => typeof v === "number");
-    const quantity1 = q[0];
-    const quantity2 = q[1];
-    const quantity3 = q[2];
+    const qValsRaw = [flat["quantity"], flat["quantity_2"], flat["quantity_3"], flat["quantity_4"], flat["quantity_5"], flat["quantity_6"]];
+    const qVals = qValsRaw.map(v => toInt(v)).filter(v => typeof v === 'number');
+    const quantity1 = qVals[0];
+    const quantity2 = qVals[1];
+    const quantity3 = qVals[2];
 
-    // Rest of fields
-    const orderComments = pick("comments", "order_comments");
-    const name          = pick("name", "full_name");
-    const email         = pick("email", "your_email");
-    const phone         = cleanPhone(pick("phone number", "phone_number", "phone"));
+    const orderComments= pick("comments", "order_comments");
+    const name         = pick("name", "full_name");
+    const email        = pick("email", "your_email");
+    const phone        = cleanPhone(pick("phone number", "phone_number", "phone"));
 
-    const billingAddr   = pick("billing address", "billing_address");
-    let province        = resolveOption("province", pick("province", "province_state"), MERGED_MAP);
-    const city          = pick("city", "billing_city");
+    const billingAddr  = pick("billing address", "billing_address");
+    let province       = resolveOption("province", pick("province", "province_state"), MERGED_MAP);
+    const city         = pick("city", "billing_city");
 
-    let method          = resolveOption("method", pick("method", "delivery_method"), MERGED_MAP);
+    let method         = resolveOption("method", pick("method", "delivery_method"), MERGED_MAP);
     if (method) method = method[0].toUpperCase() + method.slice(1).toLowerCase();
 
-    const deliveryAddr  = pick("delivery address/map pin/coordinates", "delivery_address", "map pin", "coordinates");
-    let doorsDirection  = resolveOption("doors_direction", pick("container door orientation", "container doors direction for pickup", "doors_direction"), MERGED_MAP);
+    const deliveryAddr = pick("delivery address/map pin/coordinates", "delivery_address", "map pin", "coordinates");
+    let doorsDirection = resolveOption("doors_direction", pick("container door orientation", "container doors direction for pickup", "doors_direction"), MERGED_MAP);
     if (doorsDirection) {
       const v = doorsDirection.toLowerCase();
       if (["cab", "to_cab", "doors_to_cab", "front", "doors to the cab"].includes(v)) doorsDirection = "Doors to the Cab";
       if (["back", "to_back", "doors_to_back", "rear", "doors to the back"].includes(v)) doorsDirection = "Doors to the Back";
     }
 
-    const siteName      = pick("site contact name", "site_name");
-    const sitePhone     = cleanPhone(pick("site contact phone number", "site_phone"));
-    const deliveryNotes = pick("delivery comments", "delivery_comments", "delivery_notes");
+    const siteName     = pick("site contact name", "site_name");
+    const sitePhone    = cleanPhone(pick("site contact phone number", "site_phone"));
+    const deliveryNotes= pick("delivery comments", "delivery_comments", "delivery_notes");
 
     // Bitrix helper
     const b24 = (methodName, params) => {
@@ -259,38 +239,29 @@ export default async function handler(req, res) {
 
     // Contact
     let contactId = null;
-    if (email) {
-      const byEmail = await b24("crm.contact.list", { filter: { EMAIL: email }, select: ["ID"] });
-      contactId = byEmail?.result?.[0]?.ID || null;
-    }
-    if (!contactId && phone) {
-      const byPhone = await b24("crm.contact.list", { filter: { PHONE: phone }, select: ["ID"] });
-      contactId = byPhone?.result?.[0]?.ID || null;
-    }
+    if (email) { const q = await b24("crm.contact.list", { filter: { EMAIL: email }, select: ["ID"] }); contactId = q?.result?.[0]?.ID || null; }
+    if (!contactId && phone) { const q = await b24("crm.contact.list", { filter: { PHONE: phone }, select: ["ID"] }); contactId = q?.result?.[0]?.ID || null; }
     if (!contactId && (email || phone)) {
-      const add = await b24("crm.contact.add", {
-        fields: {
-          NAME: name || (phone ? "Caller" : "Visitor"),
-          OPENED: "Y",
-          EMAIL: email ? [{ VALUE: email, VALUE_TYPE: "WORK" }] : [],
-          PHONE: phone ? [{ VALUE: phone, VALUE_TYPE: "WORK" }] : []
-        }
-      });
-      if (add?.result) contactId = add.result;
+      const c = await b24("crm.contact.add", { fields: { NAME: name || (phone ? "Caller" : "Visitor"), OPENED: "Y", EMAIL: email ? [{ VALUE: email, VALUE_TYPE: "WORK" }] : [], PHONE: phone ? [{ VALUE: phone, VALUE_TYPE: "WORK" }] : [] } });
+      if (c?.result) contactId = c.result;
     }
 
-    // Build comments, with optional mapping hints
-    const show = v => !v ? "" : looksLikeUUID(v) ? "Selection not captured" : v;
+    // Display helper: if still a UUID, show a friendly placeholder
+    const display = (group, v) => {
+      if (!v) return "";
+      return looksLikeUUID(v) ? "Selection not captured" : v;
+    };
+
     const lines = [];
     lines.push("Form: invoice request");
 
-    if (containerType1) { lines.push("", "Container type", show(containerType1)); }
+    if (containerType1) { lines.push("", "Container type", display("container_type", containerType1)); }
     if (quantity1 !== undefined) { lines.push("", "Quantity", String(quantity1)); }
 
-    if (containerType2) { lines.push("", "Add a second container type to this order", show(containerType2)); }
+    if (containerType2) { lines.push("", "Add a second container type to this order", display("container_type", containerType2)); }
     if (quantity2 !== undefined) { lines.push("", "Quantity", String(quantity2)); }
 
-    if (containerType3) { lines.push("", "Add a third container type to this order", show(containerType3)); }
+    if (containerType3) { lines.push("", "Add a third container type to this order", display("container_type", containerType3)); }
     if (quantity3 !== undefined) { lines.push("", "Quantity", String(quantity3)); }
 
     if (orderComments)  { lines.push("", "Comments", orderComments); }
@@ -298,7 +269,7 @@ export default async function handler(req, res) {
     if (email)          { lines.push("", "Email", email); }
     if (phone)          { lines.push("", "Phone number", phone); }
     if (billingAddr)    { lines.push("", "Billing address", billingAddr); }
-    if (province)       { lines.push("", "Province", looksLikeUUID(province) ? "Selection not captured" : province); }
+    if (province)       { lines.push("", "Province", display("province", province)); }
     if (city)           { lines.push("", "City", city); }
     if (method)         { lines.push("", "Method", method); }
     if (deliveryAddr)   { lines.push("", "Delivery address/Map Pin/Coordinates", deliveryAddr); }
@@ -306,11 +277,6 @@ export default async function handler(req, res) {
     if (siteName)       { lines.push("", "Site contact name", siteName); }
     if (sitePhone)      { lines.push("", "Site contact phone number", sitePhone); }
     if (deliveryNotes)  { lines.push("", "Delivery comments", deliveryNotes); }
-
-    if (DEBUG_SHOW_IDS && unresolvedIds.length) {
-      lines.push("", "Mapping hints (IDs)");
-      for (const [slot, id] of unresolvedIds) lines.push(`${slot}: ${id}`);
-    }
 
     const comments = lines.join("\n");
 
@@ -320,15 +286,14 @@ export default async function handler(req, res) {
     const assignedById = Number(process.env.ASSIGNED_BY_ID || 0);
     const sourceId     = process.env.DEAL_SOURCE_ID || "WEB";
 
-    // Title as requested
     const autoNumber = `NEW100${Date.now().toString().slice(-5)}`;
     const title = `Invoice Request (${autoNumber})`;
 
     const dealAdd = await b24("crm.deal.add", {
       fields: {
         TITLE: title.slice(0, 250),
-        CATEGORY_ID,
-        STAGE_ID,
+        CATEGORY_ID: CATEGORY_ID,
+        STAGE_ID: STAGE_ID,
         ASSIGNED_BY_ID: assignedById || undefined,
         CONTACT_ID: contactId || undefined,
         SOURCE_ID: sourceId,
