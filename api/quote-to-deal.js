@@ -1,13 +1,13 @@
-// /api/quote-to-deal.js – INVOICE REQUEST (Invoice pipeline)
-// Final fix v4: container type catalog baked in as canonical labels,
-// three-source ID→label resolution, support for third container type & quantity,
-// and the new label "Container door orientation".
+// /api/quote-to-deal.js  – INVOICE REQUEST (Invoice pipeline) with robust label-first parsing
 export default async function handler(req, res) {
-  // CORS
+  // CORS allow-list
   const originHeader = req.headers.origin || "";
   const allowedList = (process.env.ALLOWED_ORIGINS || process.env.ALLOWED_ORIGIN || "*")
     .split(",").map(s => s.trim()).filter(Boolean);
-  const allowOrigin = allowedList.includes("*") ? "*" : allowedList.includes(originHeader) ? originHeader : (allowedList[0] || "*");
+  const allowOrigin =
+    allowedList.includes("*") ? "*" :
+    allowedList.includes(originHeader) ? originHeader :
+    allowedList[0] || "*";
 
   if (req.method === "OPTIONS") {
     res.setHeader("Access-Control-Allow-Origin", allowOrigin);
@@ -17,15 +17,17 @@ export default async function handler(req, res) {
   }
   if (req.method === "GET") {
     res.setHeader("Access-Control-Allow-Origin", allowOrigin);
-    return res.status(200).json({ ok: true, method: "GET", stage: "stub-get" });
+    return res.status(200).json({ ok: true, method: "GET", stage: "ready" });
   }
-  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
 
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  // ---------- helpers ----------
+  // Read body as JSON or x-www-form-urlencoded
   async function readBody(req) {
     const chunks = [];
     for await (const c of req) chunks.push(c);
@@ -34,155 +36,145 @@ export default async function handler(req, res) {
       try { return Object.fromEntries(new URLSearchParams(raw)); } catch { return {}; }
     }
   }
+
+  // utils
   const norm = s => (s || "").toString().trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
-  const looksLikeUUID = v => typeof v === "string" && /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
+  const looksLikeUUID = v => typeof v === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(v);
   const cleanPhone = p => (p || "").replace(/[^+0-9]/g, "");
-  const toInt = v => { const n = parseInt(String(v ?? "").replace(/[^0-9]/g, ""), 10); return Number.isFinite(n) ? n : undefined; };
+  const toInt = v => {
+    const n = parseInt(String(v ?? "").replace(/[^0-9]/g, ""), 10);
+    return Number.isFinite(n) ? n : undefined;
+  };
 
-  // Canonical StoreCan container labels from the order form UI
-  const KNOWN_CONTAINER_LABELS = [
-    "20'L x 8'W x 8'6\"H NEW (1 trip)",
-    "20'L x 8'W x 8'6\"H Used [Cargo Worthy]",
-    "40'L x 8'W x 8'6\"H Used [Cargo Worthy]",
-    "40'L x 8'W x 9'6\"H HC Used [Cargo Worthy]",
-    "40'L x 8'W x 9'6\"H HC NEW (1 trip)",
-    "20'L x 8'W x 8'6\"H New (1trip) Double Doors",
-    "20'L x 8'W x 8'6\"H New (1trip) 2 Side Doors",
-    "20'L x 8'W x 8'6\"H New (1trip) Fully Open Side",
-    "40'L x 8'W x 9'6\"H HC New (1trip) Double Doors",
-    "40'L x 8'W x 9'6\"H HC New (1trip) 4 Side Doors",
-    "20'L x 8'W x 8'6\"H Used (Working) Reefer",
-    "40'L x 8'W x 9'6\"H HC Used (Working) Reefer"
-  ];
-  const normalizeLabel = s => (s || "")
-    .toString()
-    .toLowerCase()
-    .replace(/[’']/g, "'")
-    .replace(/[“”"]/g, '"')
-    .replace(/\s+/g, " ")
-    .replace(/\s/g, "")
-    .trim();
-  const CANON_BY_NORM = KNOWN_CONTAINER_LABELS.reduce((acc, lbl) => { acc[normalizeLabel(lbl)] = lbl; return acc; }, {});
-
-  // ------------- dictionaries -------------
-  const STATIC_MAP = {
-    container_type: {
-      // previously seen UUIDs
-      "e7ae7ebd-0f39-4584-96a9-5f5154bdbbfb": "40'L x 8'W x 9'6\"H HC New (1trip) Double Doors",
-      "681d358d-ca15-49cc-a215-84edf5d08fb3": "40'L x 8'W x 9'6\"H HC New (1trip)",
-      "00a288e5-000d-4125-b6ab-bc4a33773912": "40'L x 8'W x 9'6\"H HC New (1trip) Double Doors",
-      "32ed3669-a335-4852-870a-abdf2c137df1": "40'L x 8'W x 9'6\"H HC New (1trip)",
-      "fc2e9e61-be19-4065-9e5a-9b926e7c5544": "40'L x 8'W x 9'6\"H HC New (1trip) Double Doors",
-      "4b9f8044-5102-49a4-8ee0-4487ee1afb3f": "40'L x 8'W x 9'6\"H HC New (1trip)"
-    },
-    province: {
-      "c1d119fa-2270-4cf8-9055-a4fae3b98b0a": "Alberta",
-      "a0988845-750c-455c-9e26-9dadd33cf136": "Alberta",
-      "d0a3ca2e-7b91-4c3e-9925-4d912385c176": "Alberta"
-    },
-    method: { "5de9e305-16e5-43fa-9997-dd2d1c44515d": "Delivery" },
-    doors_direction: {
-      "47b72b20-b047-4c7a-8d71-8678f05a75ef": "Doors to the Cab",
-      "85a4764b-6cde-4485-bcb9-31bca4018eaf": "Doors to the Back"
+  // load optional id→label map from env
+  let OPTION_MAP = {};
+  try {
+    if (process.env.FORM_OPTION_MAP_JSON) OPTION_MAP = JSON.parse(process.env.FORM_OPTION_MAP_JSON);
+  } catch { OPTION_MAP = {}; }
+  const mapByGroup = (group, id) => {
+    if (!id) return "";
+    const g = OPTION_MAP[group] || {};
+    return g[id] || "";
+  };
+  const mapAny = id => {
+    for (const g of Object.values(OPTION_MAP || {})) {
+      if (g && typeof g === "object" && g[id]) return g[id];
     }
+    return "";
   };
 
-  let ENV_MAP = {};
-  try { ENV_MAP = JSON.parse(process.env.FORM_OPTION_MAP_JSON || "{}"); } catch { ENV_MAP = {}; }
-
-  const DYNAMIC_MAP = { container_type: {}, province: {}, method: {}, doors_direction: {} };
-
-  const mergeMaps = () => ({
-    container_type: { ...STATIC_MAP.container_type, ...(ENV_MAP.container_type || {}), ...DYNAMIC_MAP.container_type },
-    province:       { ...STATIC_MAP.province,       ...(ENV_MAP.province || {}),       ...DYNAMIC_MAP.province },
-    method:         { ...STATIC_MAP.method,         ...(ENV_MAP.method || {}),         ...DYNAMIC_MAP.method },
-    doors_direction:{ ...STATIC_MAP.doors_direction, ...(ENV_MAP.doors_direction || {}), ...DYNAMIC_MAP.doors_direction }
-  });
-
-  const resolveContainerLabel = (val, MERGED) => {
-    if (!val) return val;
-    const v = String(val);
-    if (looksLikeUUID(v)) return MERGED.container_type?.[v] || v;
-    const canon = CANON_BY_NORM[normalizeLabel(v)] || v; // snap to canonical spelling
-    return canon;
-  };
-
-  const resolveOption = (group, val, MERGED) => {
-    if (!val) return val;
-    const v = String(val);
-    if (!looksLikeUUID(v)) return v;
-    return MERGED[group]?.[v] || v;
-  };
-
-  // Flattener that also harvests choice dictionaries
-  function toFlatAndChoices(payload) {
+  // flattener that prefers human labels over IDs and supports duplicate field labels
+  function toFlat(payload) {
     const flat = {};
     const counts = {};
-    const set = (key, val) => {
+    const rawIds = {}; // for diagnostics
+
+    const put = (key, val, groupHint) => {
       if (val === undefined || val === null || val === "") return;
+
+      // try to translate IDs
+      let v = val;
+      if (looksLikeUUID(v)) {
+        v = mapByGroup(groupHint, val) || mapAny(val) || val;
+        // keep raw in case we still did not translate
+        rawIds[norm(key)] = rawIds[norm(key)] || [];
+        rawIds[norm(key)].push(val);
+      }
+
       let k = norm(key);
-      if (flat[k]) { counts[k] = (counts[k] || 1) + 1; k = `${k}_${counts[k]}`; } else counts[k] = 1;
-      flat[k] = typeof val === "string" ? val : JSON.stringify(val);
+      if (flat[k]) {
+        counts[k] = (counts[k] || 1) + 1;
+        k = `${k}_${counts[k]}`;
+      } else {
+        counts[k] = 1;
+      }
+      flat[k] = typeof v === "string" ? v : JSON.stringify(v);
     };
 
-    const harvestChoices = (fieldLabel, opts) => {
-      if (!Array.isArray(opts) || !opts.length) return;
-      const L = (fieldLabel || "").toLowerCase();
-      let group = "";
-      if (/(add a second container type|add a third container type|container type)/i.test(L)) group = "container_type";
-      else if (/province/.test(L)) group = "province";
-      else if (/door orientation|doors direction|doors.*pickup/.test(L)) group = "doors_direction";
-      else if (/method/.test(L)) group = "method";
-      if (!group) return;
-      for (const o of opts) {
-        const id = o?.id || o?.value || o?.key;
-        const label = o?.label || o?.name || o?.value;
-        if (id && label && looksLikeUUID(String(id))) DYNAMIC_MAP[group][String(id)] = label;
-      }
+    // prefer logic: if the same normalized key appears twice, and the new value is more human than the old, replace
+    const replaceIfBetter = (key, val, groupHint) => {
+      if (val === undefined || val === null || val === "") return;
+      const k = norm(key);
+      const existing = flat[k];
+
+      let v = val;
+      if (looksLikeUUID(v)) v = mapByGroup(groupHint, val) || mapAny(val) || val;
+
+      // new is better if existing is a UUID or "Selection not captured" and new is not a UUID
+      const newIsBetter =
+        existing &&
+        ((looksLikeUUID(existing) && !looksLikeUUID(v)) ||
+         (/selection not captured/i.test(existing) && v));
+      if (newIsBetter) flat[k] = v;
     };
 
-    const toLabel = (f) => {
-      let v = f?.value;
-      const choicesArr = f?.options?.choices || f?.options || f?.choices || [];
-      harvestChoices(f?.label || f?.key || f?.id, choicesArr);
+    const d = payload?.data || payload;
 
-      if (Array.isArray(v)) {
-        const labels = v.map(x => (x && typeof x === "object") ? (x.label || x.name || x.text || x.value) : x).filter(Boolean);
-        if (labels.length) return labels.join(", ");
-      }
-      if (v && typeof v === "object") return v.label || v.name || v.text || v.value || JSON.stringify(v);
+    // 1) Tally v2: data.fields[] often holds raw IDs. Capture them, but allow later overwrite.
+    if (Array.isArray(d?.fields)) {
+      for (const f of d.fields) {
+        const label = f?.label || f?.key || f?.id || "";
+        let groupHint = "";
+        const lnorm = norm(label);
+        if (lnorm.includes("container_type")) groupHint = "container_type";
+        else if (lnorm.includes("method")) groupHint = "method";
+        else if (lnorm.includes("location")) groupHint = "pickup_location";
+        else if (lnorm.includes("province")) groupHint = "province";
 
-      if (looksLikeUUID(String(v)) && choicesArr?.length) {
-        const hit = choicesArr.find(o => o?.id === v || o?.value === v || o?.key === v);
-        if (hit) return hit.label || hit.name || hit.value || String(v);
-      }
-      return (v === undefined || v === null) ? "" : String(v);
-    };
+        const val = f?.value;
+        if (val !== undefined && val !== null && val !== "") {
+          put(label, val, groupHint);
+          if (f?.key) put(`${f.key}_raw`, val, groupHint);
+          if (f?.id) put(`${f.id}_raw`, val, groupHint);
+        }
 
-    const walk = (obj) => {
-      if (!obj || typeof obj !== "object") return;
-      const d = obj.data || obj;
-      if (Array.isArray(d.fields)) {
-        for (const f of d.fields) {
-          const label = f.label || f.key || f.id || "";
-          const val = toLabel(f);
-          set(label, val);
+        // if the field exposes options.choices, translate immediately
+        const choices = f?.options?.choices || f?.choices || [];
+        if (choices && choices.length && looksLikeUUID(val)) {
+          const match = choices.find(c =>
+            c?.id === val || c?.value === val || c?.key === val
+          );
+          if (match?.label) replaceIfBetter(label, match.label, groupHint);
         }
       }
-      const answers = d.answers || d.form_response?.answers || [];
-      if (Array.isArray(answers)) {
-        for (const a of answers) {
-          const label = a.field?.label || a.field?.id || a.label || a.id || "";
-          const val = a.email || a.phone || a.text || (a.choice && (a.choice.label || a.choice.value)) || (a.choices && (a.choices.labels?.join(", ") || a.choices.values?.join(", "))) || a.value || a.answer || "";
-          set(label, val);
-        }
+    }
+
+    // 2) answers[] carries human labels. Let them overwrite IDs from step 1.
+    const answers = d?.answers || d?.form_response?.answers || [];
+    if (Array.isArray(answers)) {
+      for (const a of answers) {
+        const label = a?.field?.label || a?.label || a?.field?.id || a?.id || "";
+        const lnorm = norm(label);
+        let groupHint = "";
+        if (lnorm.includes("container_type")) groupHint = "container_type";
+        else if (lnorm.includes("method")) groupHint = "method";
+        else if (lnorm.includes("location")) groupHint = "pickup_location";
+        else if (lnorm.includes("province")) groupHint = "province";
+
+        const val =
+          a?.text ||
+          a?.email ||
+          a?.phone ||
+          (a?.choice && (a.choice.label || a.choice.value)) ||
+          (a?.choices && (a.choices.labels?.join(", ") || a.choices.values?.join(", "))) ||
+          a?.value ||
+          a?.answer ||
+          "";
+
+        if (val !== "") replaceIfBetter(label, val, groupHint);
       }
-      const hidden = d.hidden || d.meta?.hidden || {};
-      for (const [k, v] of Object.entries(hidden)) set(k, v);
-      for (const [k, v] of Object.entries(d)) { if (v && typeof v !== "object") set(k, v); }
-    };
-    walk(payload);
-    return flat;
+    }
+
+    // 3) hidden/meta
+    const hidden = d?.hidden || d?.meta?.hidden || {};
+    for (const [k, v] of Object.entries(hidden)) put(k, v);
+
+    // 4) top-level primitives
+    for (const [k, v] of Object.entries(d || {})) {
+      if (v && typeof v !== "object") put(k, v);
+    }
+
+    return { flat, rawIds };
   }
 
   try {
@@ -190,108 +182,180 @@ export default async function handler(req, res) {
     if (!base) return res.status(500).json({ error: "Missing B24_WEBHOOK_BASE" });
 
     const raw = await readBody(req);
-    const flat = toFlatAndChoices(raw);
-    const MERGED_MAP = mergeMaps();
 
-    const pick = (...c) => { for (const k of c) { const v = flat[norm(k)]; if (v) return v; } return ""; };
+    // Allow label overrides from explicitly named hidden fields if you decide to add them in Tally later
+    const labelOverrides = {
+      container_type: raw?.container_type_label,
+      container_type_2: raw?.container_type_2_label,
+      container_type_3: raw?.container_type_3_label,
+      method: raw?.method_label,
+      pickup_location: raw?.pickup_location_label,
+      province: raw?.province_label
+    };
 
-    // Container types
-    let containerType1 = resolveContainerLabel(pick("container type", "container_type", "container size"), MERGED_MAP);
-    let containerType2 = resolveContainerLabel(pick("add a second container type to this order", "container type 2", "second container type"), MERGED_MAP);
-    let containerType3 = resolveContainerLabel(pick("add a third container type to this order", "container type 3", "third container type"), MERGED_MAP);
+    const { flat, rawIds } = toFlat(raw);
 
-    // Quantities in order of appearance
-    const qValsRaw = [flat["quantity"], flat["quantity_2"], flat["quantity_3"], flat["quantity_4"], flat["quantity_5"], flat["quantity_6"]];
-    const qVals = qValsRaw.map(v => toInt(v)).filter(v => typeof v === 'number');
-    const quantity1 = qVals[0];
-    const quantity2 = qVals[1];
-    const quantity3 = qVals[2];
+    // helper to pick the first available value among candidates
+    const pick = (...cands) => {
+      for (const c of cands) {
+        const n = norm(c);
+        // prefer explicit label override
+        if (/container_type_3/.test(n) && labelOverrides.container_type_3) return labelOverrides.container_type_3;
+        if (/container_type_2/.test(n) && labelOverrides.container_type_2) return labelOverrides.container_type_2;
+        if (/container_type/.test(n) && labelOverrides.container_type) return labelOverrides.container_type;
+        if (/method/.test(n) && labelOverrides.method) return labelOverrides.method;
+        if (/pickup/.test(n) && labelOverrides.pickup_location) return labelOverrides.pickup_location;
+        if (/province/.test(n) && labelOverrides.province) return labelOverrides.province;
 
-    const orderComments= pick("comments", "order_comments");
-    const name         = pick("name", "full_name");
-    const email        = pick("email", "your_email");
-    const phone        = cleanPhone(pick("phone number", "phone_number", "phone"));
+        const v = flat[n];
+        if (v) return v;
+      }
+      return "";
+    };
 
-    const billingAddr  = pick("billing address", "billing_address");
-    let province       = resolveOption("province", pick("province", "province_state"), MERGED_MAP);
-    const city         = pick("city", "billing_city");
+    // Core fields mirroring your email layout
+    const containerType1 = pick("Container type", "container_type");
+    const quantity1      = toInt(pick("Quantity", "quantity_1"));
 
-    let method         = resolveOption("method", pick("method", "delivery_method"), MERGED_MAP);
-    if (method) method = method[0].toUpperCase() + method.slice(1).toLowerCase();
+    const containerType2 = pick("Add a second container type to this order", "container_type_2");
+    const quantity2      = toInt(pick("quantity_2", "Quantity_2"));
 
-    const deliveryAddr = pick("delivery address/map pin/coordinates", "delivery_address", "map pin", "coordinates");
-    let doorsDirection = resolveOption("doors_direction", pick("container door orientation", "container doors direction for pickup", "doors_direction"), MERGED_MAP);
-    if (doorsDirection) {
-      const v = doorsDirection.toLowerCase();
-      if (["cab", "to_cab", "doors_to_cab", "front", "doors to the cab"].includes(v)) doorsDirection = "Doors to the Cab";
-      if (["back", "to_back", "doors_to_back", "rear", "doors to the back"].includes(v)) doorsDirection = "Doors to the Back";
-    }
+    const containerType3 = pick("Add a third container type to this order", "container_type_3");
+    const quantity3      = toInt(pick("quantity_3", "Quantity_3"));
 
-    const siteName     = pick("site contact name", "site_name");
-    const sitePhone    = cleanPhone(pick("site contact phone number", "site_phone"));
-    const deliveryNotes= pick("delivery comments", "delivery_comments", "delivery_notes");
+    const orderComments  = pick("Comments", "comments", "order_comments");
+
+    const name           = pick("Name", "full_name", "Full name");
+    const email          = pick("Email", "your_email");
+    const phone          = cleanPhone(pick("Phone number", "phone", "phone_number"));
+
+    const billingAddr    = pick("Billing address", "billing_address", "address");
+    const province       = pick("Province", "province");
+    const city           = pick("City", "city");
+
+    const methodHuman    = pick("Method", "method");
+    const deliveryAddr   = pick("Delivery address/Map Pin/Coordinates", "delivery_address");
+    const doorsDirection = pick("Container door orientation", "Container doors direction for pickup", "doors_direction");
+
+    const siteName       = pick("Site contact name", "site_name");
+    const sitePhone      = cleanPhone(pick("Site contact phone number", "site_phone"));
+    const deliveryNotes  = pick("Delivery comments", "delivery_comments", "delivery_notes");
+
+    const pickupLocation = pick("Location", "pickup_location");
+
+    const utm_source     = pick("utm_source");
+    const utm_medium     = pick("utm_medium");
+    const utm_campaign   = pick("utm_campaign");
+    const utm_term       = pick("utm_term");
+    const utm_content    = pick("utm_content");
+
+    const nameForContact = name || (phone ? "Caller" : "Visitor");
 
     // Bitrix helper
     const b24 = (methodName, params) => {
       const endpoint = base.endsWith("/") ? `${base}${methodName}.json` : `${base}/${methodName}.json`;
-      return fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(params || {}) }).then(r => r.json());
+      return fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(params || {})
+      }).then(r => r.json());
     };
 
-    // Contact
+    // 1) Find or create contact
     let contactId = null;
-    if (email) { const q = await b24("crm.contact.list", { filter: { EMAIL: email }, select: ["ID"] }); contactId = q?.result?.[0]?.ID || null; }
-    if (!contactId && phone) { const q = await b24("crm.contact.list", { filter: { PHONE: phone }, select: ["ID"] }); contactId = q?.result?.[0]?.ID || null; }
+    if (email) {
+      const byEmail = await b24("crm.contact.list", { filter: { EMAIL: email }, select: ["ID"] });
+      contactId = byEmail?.result?.[0]?.ID || null;
+    }
+    if (!contactId && phone) {
+      const byPhone = await b24("crm.contact.list", { filter: { PHONE: phone }, select: ["ID"] });
+      contactId = byPhone?.result?.[0]?.ID || null;
+    }
     if (!contactId && (email || phone)) {
-      const c = await b24("crm.contact.add", { fields: { NAME: name || (phone ? "Caller" : "Visitor"), OPENED: "Y", EMAIL: email ? [{ VALUE: email, VALUE_TYPE: "WORK" }] : [], PHONE: phone ? [{ VALUE: phone, VALUE_TYPE: "WORK" }] : [] } });
-      if (c?.result) contactId = c.result;
+      const contactCreate = await b24("crm.contact.add", {
+        fields: {
+          NAME: nameForContact,
+          OPENED: "Y",
+          EMAIL: email ? [{ VALUE: email, VALUE_TYPE: "WORK" }] : [],
+          PHONE: phone ? [{ VALUE: phone, VALUE_TYPE: "WORK" }] : []
+        }
+      });
+      if (contactCreate?.result) contactId = contactCreate.result;
     }
 
-    // Display helper: if still a UUID, show a friendly placeholder
-    const display = (group, v) => {
-      if (!v) return "";
-      return looksLikeUUID(v) ? "Selection not captured" : v;
-    };
-
+    // 2) Build Bitrix comments, mirroring your email
     const lines = [];
     lines.push("Form: invoice request");
 
-    if (containerType1) { lines.push("", "Container type", display("container_type", containerType1)); }
+    const showOrPlaceholder = v => v || "Selection not captured";
+
+    lines.push("", "Container type", showOrPlaceholder(containerType1));
     if (quantity1 !== undefined) { lines.push("", "Quantity", String(quantity1)); }
 
-    if (containerType2) { lines.push("", "Add a second container type to this order", display("container_type", containerType2)); }
-    if (quantity2 !== undefined) { lines.push("", "Quantity", String(quantity2)); }
+    if (containerType2 || quantity2 !== undefined) {
+      lines.push("", "Add a second container type to this order", showOrPlaceholder(containerType2));
+      if (quantity2 !== undefined) { lines.push("", "Quantity", String(quantity2)); }
+    }
 
-    if (containerType3) { lines.push("", "Add a third container type to this order", display("container_type", containerType3)); }
-    if (quantity3 !== undefined) { lines.push("", "Quantity", String(quantity3)); }
+    if (containerType3 || quantity3 !== undefined) {
+      lines.push("", "Add a third container type to this order", showOrPlaceholder(containerType3));
+      if (quantity3 !== undefined) { lines.push("", "Quantity", String(quantity3)); }
+    }
 
     if (orderComments)  { lines.push("", "Comments", orderComments); }
     if (name)           { lines.push("", "Name", name); }
     if (email)          { lines.push("", "Email", email); }
     if (phone)          { lines.push("", "Phone number", phone); }
+
     if (billingAddr)    { lines.push("", "Billing address", billingAddr); }
-    if (province)       { lines.push("", "Province", display("province", province)); }
+    if (province)       { lines.push("", "Province", province); }
     if (city)           { lines.push("", "City", city); }
-    if (method)         { lines.push("", "Method", method); }
+
+    if (methodHuman)    { lines.push("", "Method", methodHuman); }
+    if (pickupLocation) { lines.push("", "Location", pickupLocation); }
+
     if (deliveryAddr)   { lines.push("", "Delivery address/Map Pin/Coordinates", deliveryAddr); }
     if (doorsDirection) { lines.push("", "Container door orientation", doorsDirection); }
     if (siteName)       { lines.push("", "Site contact name", siteName); }
     if (sitePhone)      { lines.push("", "Site contact phone number", sitePhone); }
     if (deliveryNotes)  { lines.push("", "Delivery comments", deliveryNotes); }
 
+    if (utm_source || utm_medium || utm_campaign || utm_term || utm_content) {
+      lines.push("", "UTM", `source=${utm_source || ""}, medium=${utm_medium || ""}, campaign=${utm_campaign || ""}, term=${utm_term || ""}, content=${utm_content || ""}`);
+    }
+
+    // Helpful hints when IDs slip through
+    const showHints = String(process.env.DEBUG_SHOW_RAW_IDS || "").trim() === "1";
+    if (showHints) {
+      const hintLines = [];
+      if (looksLikeUUID(containerType1)) hintLines.push(`container_type_1: ${containerType1}`);
+      if (looksLikeUUID(containerType2)) hintLines.push(`container_type_2: ${containerType2}`);
+      if (looksLikeUUID(containerType3)) hintLines.push(`container_type_3: ${containerType3}`);
+      if (looksLikeUUID(methodHuman))    hintLines.push(`method: ${methodHuman}`);
+      if (looksLikeUUID(pickupLocation)) hintLines.push(`pickup_location: ${pickupLocation}`);
+      if (hintLines.length) {
+        lines.push("", "Mapping hints (IDs)", ...hintLines);
+      }
+    }
+
     const comments = lines.join("\n");
 
-    // Pipeline
-    const CATEGORY_ID = Number(process.env.INVOICE_CATEGORY_ID ?? 6);
-    const STAGE_ID = process.env.INVOICE_STAGE_ID ?? `C${CATEGORY_ID}:NEW`;
-    const assignedById = Number(process.env.ASSIGNED_BY_ID || 0);
-    const sourceId     = process.env.DEAL_SOURCE_ID || "WEB";
+    // 3) Create deal in Invoice pipeline
+    const CATEGORY_ID = Number(process.env.INVOICE_CATEGORY_ID ?? process.env.QUOTE_CATEGORY_ID ?? 6);
+    const STAGE_ID = process.env.INVOICE_STAGE_ID ?? process.env.QUOTE_STAGE_ID ?? (CATEGORY_ID === 0 ? "NEW" : `C${CATEGORY_ID}:NEW`);
+    const assignedById = Number(process.env.QUOTE_ASSIGNED_BY_ID || process.env.ASSIGNED_BY_ID || 0);
+    const sourceId     = process.env.QUOTE_SOURCE_ID || process.env.DEAL_SOURCE_ID || "WEB";
 
-    const autoNumber = `NEW100${Date.now().toString().slice(-5)}`;
-    const title = `Invoice Request (${autoNumber})`;
+    // Title: Invoice Request (NEW + short timecode)
+    const newCode = `NEW${Math.floor(Date.now() / 1000)}`;
+    const titleBits = [
+      `Invoice Request (${newCode})`,
+      city || province || ""
+    ].filter(Boolean).join(" | ");
 
     const dealAdd = await b24("crm.deal.add", {
       fields: {
-        TITLE: title.slice(0, 250),
+        TITLE: titleBits.slice(0, 250),
         CATEGORY_ID: CATEGORY_ID,
         STAGE_ID: STAGE_ID,
         ASSIGNED_BY_ID: assignedById || undefined,
