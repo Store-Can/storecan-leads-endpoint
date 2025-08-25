@@ -1,4 +1,4 @@
-// /api/quote-to-deal.js – INVOICE REQUEST with robust array/ID → label handling
+// /api/quote-to-deal.js — Invoice Request with rock-solid ID→Label resolution
 export default async function handler(req, res) {
   // CORS
   const originHeader = req.headers.origin || "";
@@ -17,17 +17,15 @@ export default async function handler(req, res) {
   }
   if (req.method === "GET") {
     res.setHeader("Access-Control-Allow-Origin", allowOrigin);
-    return res.status(200).json({ ok: true, method: "GET" });
+    return res.status(200).json({ ok: true, method: "GET", stage: "ready" });
   }
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  // Body reader
+  // Utilities
   async function readBody(req) {
     const chunks = [];
     for await (const c of req) chunks.push(c);
@@ -36,130 +34,140 @@ export default async function handler(req, res) {
       try { return Object.fromEntries(new URLSearchParams(raw)); } catch { return {}; }
     }
   }
-
-  // utils
   const norm = s => (s || "").toString().trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
-  const looksLikeUUID = v => typeof v === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(v);
+  const looksUUID = v => typeof v === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(v);
+  const toInt = v => { const n = parseInt(String(v ?? "").replace(/[^0-9]/g, ""), 10); return Number.isFinite(n) ? n : undefined; };
   const cleanPhone = p => (p || "").replace(/[^+0-9]/g, "");
-  const toInt = v => {
-    const n = parseInt(String(v ?? "").replace(/[^0-9]/g, ""), 10);
-    return Number.isFinite(n) ? n : undefined;
-  };
 
-  // optional env map
+  // Optional manual map (safety net)
   let OPTION_MAP = {};
-  try {
-    if (process.env.FORM_OPTION_MAP_JSON) OPTION_MAP = JSON.parse(process.env.FORM_OPTION_MAP_JSON);
-  } catch { OPTION_MAP = {}; }
-  const mapByGroup = (group, id) => {
-    if (!id) return "";
-    const g = OPTION_MAP[group] || {};
-    return g[id] || "";
-  };
-  const mapAny = id => {
-    for (const g of Object.values(OPTION_MAP || {})) {
-      if (g && typeof g === "object" && g[id]) return g[id];
-    }
-    return "";
-  };
+  try { if (process.env.FORM_OPTION_MAP_JSON) OPTION_MAP = JSON.parse(process.env.FORM_OPTION_MAP_JSON); } catch {}
 
-  // Convert raw value(s) to human label(s)
-  function idsToLabels(ids, choices, groupHint) {
-    const arr = Array.isArray(ids) ? ids : [ids];
-    const labels = [];
-    for (const it of arr) {
-      if (it && typeof it === "object") {
-        const lbl = it.label || it.name || it.text || it.value;
-        if (lbl) { labels.push(String(lbl)); continue; }
-      }
-      if (typeof it === "string") {
-        // try choices from the field first
-        const hit = (choices || []).find(c => c?.id === it || c?.key === it || c?.value === it);
-        if (hit?.label) { labels.push(String(hit.label)); continue; }
-        // try env map
-        const m = (groupHint && mapByGroup(groupHint, it)) || mapAny(it);
-        if (m) { labels.push(String(m)); continue; }
-        // otherwise keep raw string
-        labels.push(it);
-      }
+  // In-memory cache for Tally choice dictionaries per form
+  globalThis.__TALLY_CACHE__ = globalThis.__TALLY_CACHE__ || {};
+  async function fetchTallyChoices(formId) {
+    if (!formId) return {};
+    const cache = globalThis.__TALLY_CACHE__;
+    const hit = cache[formId];
+    const now = Date.now();
+    if (hit && now - hit.ts < 6 * 60 * 60 * 1000) return hit.map; // 6h TTL
+
+    const key = process.env.TALLY_API_KEY || "";
+    if (!key) return {}; // no API key, skip
+
+    // Try both header styles to avoid guessing wrong
+    async function tryFetch(hdr) {
+      const r = await fetch(`https://api.tally.so/forms/${formId}`, { headers: hdr });
+      if (r.ok) return r.json();
+      // Some accounts expose fields under /forms/{id}/responses/schema
+      const r2 = await fetch(`https://api.tally.so/forms/${formId}/responses/schema`, { headers: hdr }).catch(()=>null);
+      if (r2 && r2.ok) return r2.json();
+      return null;
     }
-    // dedupe and join
-    return [...new Set(labels.filter(Boolean))].join(", ");
+    const headersList = [
+      { Authorization: `Bearer ${key}` },
+      { "Tally-Api-Key": key }
+    ];
+
+    let json = null;
+    for (const h of headersList) {
+      try { json = await tryFetch(h); } catch {} // ignore
+      if (json) break;
+    }
+    if (!json) return {}; // fail quiet, fallback to env map
+
+    // Walk any JSON structure and collect choices {id,label}
+    const map = {};
+    const walk = (node) => {
+      if (!node) return;
+      if (Array.isArray(node)) { node.forEach(walk); return; }
+      if (typeof node === "object") {
+        const choices = node.choices || node.options?.choices;
+        if (Array.isArray(choices)) {
+          for (const c of choices) {
+            const id = c?.id || c?.value || c?.key;
+            const label = c?.label || c?.name || c?.value;
+            if (id && label) map[id] = String(label);
+          }
+        }
+        for (const v of Object.values(node)) walk(v);
+      }
+    };
+    walk(json);
+    cache[formId] = { ts: now, map };
+    return map;
   }
 
-  // flatten Tally payload, prefer labels, handle arrays
-  function toFlat(payload) {
-    const flat = {};
-    const counts = {};
-    const put = (key, val) => {
-      if (val === undefined || val === null || val === "") return;
-      let k = norm(key);
-      if (flat[k]) {
-        counts[k] = (counts[k] || 1) + 1;
-        k = `${k}_${counts[k]}`;
-      } else counts[k] = 1;
-      flat[k] = String(val); // always plain string
-    };
-    const replace = (key, val) => { if (val !== undefined && val !== null && val !== "") flat[norm(key)] = String(val); };
-
-    const d = payload?.data || payload;
-
-    // 1) fields[]: may contain raw IDs, sometimes with options.choices
-    if (Array.isArray(d?.fields)) {
-      for (const f of d.fields) {
-        const label = f?.label || f?.key || f?.id || "";
-        const lnorm = norm(label);
-        let groupHint = "";
-        if (lnorm.includes("container_type")) groupHint = "container_type";
-        else if (lnorm.includes("method")) groupHint = "method";
-        else if (lnorm.includes("location")) groupHint = "pickup_location";
-        else if (lnorm.includes("province")) groupHint = "province";
-        else if (lnorm.includes("door")) groupHint = "door_orientation";
-
-        const choices = f?.options?.choices || f?.choices || [];
-
-        if (f?.value !== undefined) {
-          const val = idsToLabels(f.value, choices, groupHint);
-          put(label, val);
+  // Value translator
+  function idsToLabels(input, choiceMap, groupMap) {
+    const arr = Array.isArray(input) ? input : [input];
+    const out = [];
+    for (let it of arr) {
+      if (it === undefined || it === null || it === "") continue;
+      if (typeof it === "object") {
+        const lbl = it.label || it.name || it.text || it.value;
+        if (lbl) { out.push(String(lbl)); continue; }
+        it = String(it);
+      }
+      if (typeof it === "string") {
+        if (looksUUID(it)) {
+          const lbl = choiceMap[it] || groupMap[it] || "";
+          out.push(lbl || it);
+        } else {
+          out.push(it);
         }
       }
     }
+    // compact and dedupe
+    return [...new Set(out.filter(Boolean))].join(", ");
+  }
 
-    // 2) answers[]: usually carries human label(s). Overwrite previous values.
-    const answers = d?.answers || d?.form_response?.answers || [];
+  // Parse Tally payload, resolve IDs using choice maps
+  async function parseTally(payload) {
+    const data = payload?.data || payload || {};
+    const formId = data?.form_id || data?.formId || process.env.TALLY_FORM_ID || "";
+    const choiceMap = await fetchTallyChoices(String(formId).trim());
+    const groupMap = {
+      // optional group-specific fallbacks
+      ...(OPTION_MAP.container_type || {}),
+      ...(OPTION_MAP.method || {}),
+      ...(OPTION_MAP.pickup_location || {}),
+      ...(OPTION_MAP.province || {}),
+      ...(OPTION_MAP.door_orientation || {})
+    };
+
+    const flat = {};
+    const put = (k, v) => { if (v !== undefined && v !== null && v !== "") flat[norm(k)] = String(v); };
+
+    // 1) fields[] first pass, convert arrays or UUIDs to labels
+    if (Array.isArray(data.fields)) {
+      for (const f of data.fields) {
+        const label = f?.label || f?.key || f?.id || "";
+        const val = f?.value;
+        if (val !== undefined) put(label, idsToLabels(val, choiceMap, groupMap));
+      }
+    }
+
+    // 2) answers[] second pass, prefer any explicit text
+    const answers = data.answers || data.form_response?.answers || [];
     if (Array.isArray(answers)) {
       for (const a of answers) {
         const label = a?.field?.label || a?.label || a?.field?.id || a?.id || "";
-        const lnorm = norm(label);
-        let groupHint = "";
-        if (lnorm.includes("container_type")) groupHint = "container_type";
-        else if (lnorm.includes("method")) groupHint = "method";
-        else if (lnorm.includes("location")) groupHint = "pickup_location";
-        else if (lnorm.includes("province")) groupHint = "province";
-        else if (lnorm.includes("door")) groupHint = "door_orientation";
-
-        const choices = a?.field?.choices || a?.choices?.choices || [];
-        // Build a best-value from all possible shapes
         const val =
           a?.text || a?.email || a?.phone ||
           (a?.choice && (a.choice.label || a.choice.value)) ||
           (a?.choices && (a.choices.labels?.join(", ") || a.choices.values?.join(", "))) ||
-          (a?.value !== undefined ? idsToLabels(a.value, choices, groupHint) : "");
-
-        if (val) replace(label, val);
+          (a?.value !== undefined ? idsToLabels(a.value, choiceMap, groupMap) : "");
+        if (val) put(label, val);
       }
     }
 
-    // 3) hidden/meta
-    const hidden = d?.hidden || d?.meta?.hidden || {};
+    // 3) hidden/meta and top-level scalars
+    const hidden = data.hidden || data.meta?.hidden || {};
     for (const [k, v] of Object.entries(hidden)) put(k, v);
+    for (const [k, v] of Object.entries(data)) if (v && typeof v !== "object") put(k, v);
 
-    // 4) top-level primitives
-    for (const [k, v] of Object.entries(d || {})) {
-      if (v && typeof v !== "object") put(k, v);
-    }
-
-    return flat;
+    return { flat, choiceMap };
   }
 
   try {
@@ -167,35 +175,17 @@ export default async function handler(req, res) {
     if (!base) return res.status(500).json({ error: "Missing B24_WEBHOOK_BASE" });
 
     const raw = await readBody(req);
-    const flat = toFlat(raw);
+    const { flat, choiceMap } = await parseTally(raw);
 
-    // prefer explicit hidden label overrides if you later add them in Tally
-    const labelOverrides = {
-      container_type: raw?.container_type_label,
-      container_type_2: raw?.container_type_2_label,
-      container_type_3: raw?.container_type_3_label,
-      method: raw?.method_label,
-      pickup_location: raw?.pickup_location_label,
-      province: raw?.province_label
-    };
-
-    const pick = (...cands) => {
-      for (const c of cands) {
-        const n = norm(c);
-        if (/container_type_3/.test(n) && labelOverrides.container_type_3) return labelOverrides.container_type_3;
-        if (/container_type_2/.test(n) && labelOverrides.container_type_2) return labelOverrides.container_type_2;
-        if (/container_type$/.test(n)   && labelOverrides.container_type)   return labelOverrides.container_type;
-        if (/method/.test(n)            && labelOverrides.method)           return labelOverrides.method;
-        if (/pickup|location/.test(n)   && labelOverrides.pickup_location)  return labelOverrides.pickup_location;
-        if (/province/.test(n)          && labelOverrides.province)         return labelOverrides.province;
-
-        const v = flat[n];
+    const pick = (...names) => {
+      for (const n of names) {
+        const v = flat[norm(n)];
         if (v) return v;
       }
       return "";
     };
 
-    // fields for comments
+    // Read fields
     const containerType1 = pick("Container type", "container_type");
     const quantity1      = toInt(pick("Quantity", "quantity_1"));
 
@@ -231,8 +221,6 @@ export default async function handler(req, res) {
     const utm_term       = pick("utm_term");
     const utm_content    = pick("utm_content");
 
-    const nameForContact = name || (phone ? "Caller" : "Visitor");
-
     // Bitrix helper
     const b24 = (methodName, params) => {
       const endpoint = base.endsWith("/") ? `${base}${methodName}.json` : `${base}/${methodName}.json`;
@@ -244,6 +232,7 @@ export default async function handler(req, res) {
     };
 
     // Contact
+    const nameForContact = name || (phone ? "Caller" : "Visitor");
     let contactId = null;
     if (email) {
       const byEmail = await b24("crm.contact.list", { filter: { EMAIL: email }, select: ["ID"] });
@@ -265,13 +254,13 @@ export default async function handler(req, res) {
       if (add?.result) contactId = add.result;
     }
 
-    // Comments
+    // Comment block
     const lines = [];
     const showOr = v => v || "Selection not captured";
     lines.push("Form: invoice request");
 
     lines.push("", "Container type", showOr(containerType1));
-    if (quantity1 !== undefined) { lines.push("", "Quantity", String(quantity1)); }
+    if (quantity1 !== undefined) lines.push("", "Quantity", String(quantity1));
 
     if (containerType2 || quantity2 !== undefined) {
       lines.push("", "Add a second container type to this order", showOr(containerType2));
@@ -283,25 +272,42 @@ export default async function handler(req, res) {
       if (quantity3 !== undefined) lines.push("", "Quantity", String(quantity3));
     }
 
-    if (orderComments)  { lines.push("", "Comments", orderComments); }
-    if (name)           { lines.push("", "Name", name); }
-    if (email)          { lines.push("", "Email", email); }
-    if (phone)          { lines.push("", "Phone number", phone); }
-    if (billingAddr)    { lines.push("", "Billing address", billingAddr); }
-    if (province)       { lines.push("", "Province", province); }
-    if (city)           { lines.push("", "City", city); }
+    if (orderComments)  lines.push("", "Comments", orderComments);
+    if (name)           lines.push("", "Name", name);
+    if (email)          lines.push("", "Email", email);
+    if (phone)          lines.push("", "Phone number", phone);
 
-    if (methodHuman)    { lines.push("", "Method", methodHuman); }
-    if (pickupLocation) { lines.push("", "Location", pickupLocation); }
+    if (billingAddr)    lines.push("", "Billing address", billingAddr);
+    if (province)       lines.push("", "Province", province);
+    if (city)           lines.push("", "City", city);
 
-    if (deliveryAddr)   { lines.push("", "Delivery address/Map Pin/Coordinates", deliveryAddr); }
-    if (doorsDirection) { lines.push("", "Container door orientation", doorsDirection); }
-    if (siteName)       { lines.push("", "Site contact name", siteName); }
-    if (sitePhone)      { lines.push("", "Site contact phone number", sitePhone); }
-    if (deliveryNotes)  { lines.push("", "Delivery comments", deliveryNotes); }
+    if (methodHuman)    lines.push("", "Method", methodHuman);
+    if (pickupLocation) lines.push("", "Location", pickupLocation);
+
+    if (deliveryAddr)   lines.push("", "Delivery address/Map Pin/Coordinates", deliveryAddr);
+    if (doorsDirection) lines.push("", "Container door orientation", doorsDirection);
+    if (siteName)       lines.push("", "Site contact name", siteName);
+    if (sitePhone)      lines.push("", "Site contact phone number", sitePhone);
+    if (deliveryNotes)  lines.push("", "Delivery comments", deliveryNotes);
 
     if (utm_source || utm_medium || utm_campaign || utm_term || utm_content) {
       lines.push("", "UTM", `source=${utm_source || ""}, medium=${utm_medium || ""}, campaign=${utm_campaign || ""}, term=${utm_term || ""}, content=${utm_content || ""}`);
+    }
+
+    // If anything is still an unknown UUID, print a short hint so you can add it once to FORM_OPTION_MAP_JSON
+    const showHints = String(process.env.DEBUG_SHOW_RAW_IDS || "").trim() === "1";
+    if (showHints) {
+      const hints = [];
+      const maybeIDs = [
+        ["container_type_1", containerType1],
+        ["container_type_2", containerType2],
+        ["container_type_3", containerType3],
+        ["province", province],
+        ["method", methodHuman],
+        ["door_orientation", doorsDirection]
+      ];
+      for (const [k, v] of maybeIDs) if (looksUUID(v)) hints.push(`${k}: ${v}`);
+      if (hints.length) lines.push("", "Mapping hints (IDs)", ...hints);
     }
 
     const comments = lines.join("\n");
@@ -312,14 +318,13 @@ export default async function handler(req, res) {
     const assignedById = Number(process.env.QUOTE_ASSIGNED_BY_ID || process.env.ASSIGNED_BY_ID || 0);
     const sourceId     = process.env.QUOTE_SOURCE_ID || process.env.DEAL_SOURCE_ID || "WEB";
     const newCode = `NEW${Math.floor(Date.now() / 1000)}`;
-
     const title = [`Invoice Request (${newCode})`, city || province].filter(Boolean).join(" | ").slice(0, 250);
 
     const addDeal = await b24("crm.deal.add", {
       fields: {
         TITLE: title,
-        CATEGORY_ID: CATEGORY_ID,
-        STAGE_ID: STAGE_ID,
+        CATEGORY_ID,
+        STAGE_ID,
         ASSIGNED_BY_ID: assignedById || undefined,
         CONTACT_ID: contactId || undefined,
         SOURCE_ID: sourceId,
