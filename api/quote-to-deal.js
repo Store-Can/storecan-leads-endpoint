@@ -1,4 +1,4 @@
-// /api/quote-to-deal.js — Invoice Request with rock-solid ID→Label resolution
+// /api/quote-to-deal.js — Invoice Request with robust ID→Label resolution and quantity support
 export default async function handler(req, res) {
   // CORS
   const originHeader = req.headers.origin || "";
@@ -25,7 +25,7 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  // Utilities
+  // Helpers
   async function readBody(req) {
     const chunks = [];
     for await (const c of req) chunks.push(c);
@@ -53,13 +53,11 @@ export default async function handler(req, res) {
     if (hit && now - hit.ts < 6 * 60 * 60 * 1000) return hit.map; // 6h TTL
 
     const key = process.env.TALLY_API_KEY || "";
-    if (!key) return {}; // no API key, skip
+    if (!key) return {};
 
-    // Try both header styles to avoid guessing wrong
     async function tryFetch(hdr) {
       const r = await fetch(`https://api.tally.so/forms/${formId}`, { headers: hdr });
       if (r.ok) return r.json();
-      // Some accounts expose fields under /forms/{id}/responses/schema
       const r2 = await fetch(`https://api.tally.so/forms/${formId}/responses/schema`, { headers: hdr }).catch(()=>null);
       if (r2 && r2.ok) return r2.json();
       return null;
@@ -71,12 +69,12 @@ export default async function handler(req, res) {
 
     let json = null;
     for (const h of headersList) {
-      try { json = await tryFetch(h); } catch {} // ignore
+      try { json = await tryFetch(h); } catch {}
       if (json) break;
     }
-    if (!json) return {}; // fail quiet, fallback to env map
+    if (!json) return {};
 
-    // Walk any JSON structure and collect choices {id,label}
+    // Walk JSON and collect choices {id,label}
     const map = {};
     const walk = (node) => {
       if (!node) return;
@@ -118,7 +116,6 @@ export default async function handler(req, res) {
         }
       }
     }
-    // compact and dedupe
     return [...new Set(out.filter(Boolean))].join(", ");
   }
 
@@ -127,8 +124,9 @@ export default async function handler(req, res) {
     const data = payload?.data || payload || {};
     const formId = data?.form_id || data?.formId || process.env.TALLY_FORM_ID || "";
     const choiceMap = await fetchTallyChoices(String(formId).trim());
+
+    // group-level fallbacks
     const groupMap = {
-      // optional group-specific fallbacks
       ...(OPTION_MAP.container_type || {}),
       ...(OPTION_MAP.method || {}),
       ...(OPTION_MAP.pickup_location || {}),
@@ -136,10 +134,22 @@ export default async function handler(req, res) {
       ...(OPTION_MAP.door_orientation || {})
     };
 
+    // duplicate-aware flattener so multiple "Quantity" fields are kept
     const flat = {};
-    const put = (k, v) => { if (v !== undefined && v !== null && v !== "") flat[norm(k)] = String(v); };
+    const counts = {};
+    function put(k, v) {
+      if (v === undefined || v === null || v === "") return;
+      let key = norm(k);
+      if (flat[key] !== undefined) {
+        counts[key] = (counts[key] || 1) + 1;
+        key = `${key}_${counts[key]}`;   // Quantity -> quantity_2, quantity_3
+      } else {
+        counts[key] = 1;                 // first stays "quantity"
+      }
+      flat[key] = String(v);
+    }
 
-    // 1) fields[] first pass, convert arrays or UUIDs to labels
+    // 1) fields[] first pass
     if (Array.isArray(data.fields)) {
       for (const f of data.fields) {
         const label = f?.label || f?.key || f?.id || "";
@@ -148,7 +158,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 2) answers[] second pass, prefer any explicit text
+    // 2) answers[] second pass, prefer explicit text
     const answers = data.answers || data.form_response?.answers || [];
     if (Array.isArray(answers)) {
       for (const a of answers) {
@@ -175,15 +185,8 @@ export default async function handler(req, res) {
     if (!base) return res.status(500).json({ error: "Missing B24_WEBHOOK_BASE" });
 
     const raw = await readBody(req);
-    const { flat, choiceMap } = await parseTally(raw);
-
-    const pick = (...names) => {
-      for (const n of names) {
-        const v = flat[norm(n)];
-        if (v) return v;
-      }
-      return "";
-    };
+    const { flat } = await parseTally(raw);
+    const pick = (...names) => { for (const n of names) { const v = flat[norm(n)]; if (v) return v; } return ""; };
 
     // Read fields
     const containerType1 = pick("Container type", "container_type");
@@ -294,22 +297,6 @@ export default async function handler(req, res) {
       lines.push("", "UTM", `source=${utm_source || ""}, medium=${utm_medium || ""}, campaign=${utm_campaign || ""}, term=${utm_term || ""}, content=${utm_content || ""}`);
     }
 
-    // If anything is still an unknown UUID, print a short hint so you can add it once to FORM_OPTION_MAP_JSON
-    const showHints = String(process.env.DEBUG_SHOW_RAW_IDS || "").trim() === "1";
-    if (showHints) {
-      const hints = [];
-      const maybeIDs = [
-        ["container_type_1", containerType1],
-        ["container_type_2", containerType2],
-        ["container_type_3", containerType3],
-        ["province", province],
-        ["method", methodHuman],
-        ["door_orientation", doorsDirection]
-      ];
-      for (const [k, v] of maybeIDs) if (looksUUID(v)) hints.push(`${k}: ${v}`);
-      if (hints.length) lines.push("", "Mapping hints (IDs)", ...hints);
-    }
-
     const comments = lines.join("\n");
 
     // Deal
@@ -337,6 +324,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: "Failed to create deal", raw: addDeal });
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ error: e?.message || "Server error" });
-  }
-}
+    return res.status(500).json({ error:
